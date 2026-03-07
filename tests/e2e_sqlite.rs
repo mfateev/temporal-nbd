@@ -115,71 +115,33 @@ fn temporal_repo_root() -> anyhow::Result<PathBuf> {
 }
 
 fn build_temporal_server(temporal_repo: &Path, output_bin: &Path) -> anyhow::Result<()> {
-    let api_go_ref = env::var("TEMPORAL_API_GO_REF").unwrap_or_else(|_| "master".to_string());
-    let go_bin = env::var("GO_BIN").unwrap_or_else(|_| {
+    let go_bin = resolve_go_bin();
+    run_command(
+        temporal_server_build_command(&go_bin, temporal_repo, output_bin),
+        "build temporal-server",
+    )
+}
+
+fn resolve_go_bin() -> String {
+    env::var("GO_BIN").unwrap_or_else(|_| {
         if Path::new("/usr/local/go/bin/go").exists() {
             "/usr/local/go/bin/go".to_string()
         } else {
             "go".to_string()
         }
-    });
+    })
+}
 
-    let modfile = env::temp_dir().join(format!("temporal-rust-e2e-{}.mod", Uuid::new_v4()));
-    let sumfile = modfile.with_extension("sum");
-    fs::copy(temporal_repo.join("go.mod"), &modfile).with_context(|| {
-        format!(
-            "failed to copy go.mod from {} to {}",
-            temporal_repo.display(),
-            modfile.display()
-        )
-    })?;
-    fs::copy(temporal_repo.join("go.sum"), &sumfile).with_context(|| {
-        format!(
-            "failed to copy go.sum from {} to {}",
-            temporal_repo.display(),
-            sumfile.display()
-        )
-    })?;
-    let goflags = format!("-modfile={}", modfile.display());
-
-    let update_api_result = run_command(
-        {
-            let mut cmd = Command::new(&go_bin);
-            cmd.arg("get")
-                .arg(format!("go.temporal.io/api@{api_go_ref}"))
-                .env("GOFLAGS", &goflags)
-                .current_dir(temporal_repo);
-            cmd
-        },
-        "update go.temporal.io/api for temporal build",
-    );
-    if let Err(err) = update_api_result {
-        let _ = fs::remove_file(&modfile);
-        let _ = fs::remove_file(&sumfile);
-        return Err(err);
-    }
-
-    let build_result = run_command(
-        {
-            let mut cmd = Command::new(&go_bin);
-            cmd.arg("build")
-                .arg("-tags")
-                .arg("disable_grpc_modules")
-                .arg("-o")
-                .arg(output_bin)
-                .arg("./cmd/server")
-                .env("GOFLAGS", &goflags)
-                .current_dir(temporal_repo);
-            cmd
-        },
-        "build temporal-server",
-    );
-
-    let _ = fs::remove_file(&modfile);
-    let _ = fs::remove_file(&sumfile);
-    build_result?;
-
-    Ok(())
+fn temporal_server_build_command(go_bin: &str, temporal_repo: &Path, output_bin: &Path) -> Command {
+    let mut cmd = Command::new(go_bin);
+    cmd.arg("build")
+        .arg("-tags")
+        .arg("disable_grpc_modules")
+        .arg("-o")
+        .arg(output_bin)
+        .arg("./cmd/server")
+        .current_dir(temporal_repo);
+    cmd
 }
 
 fn run_command(mut command: Command, context_msg: &str) -> anyhow::Result<()> {
@@ -397,5 +359,35 @@ impl Drop for ServerProcess {
                 let _ = self.child.wait();
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::ffi::OsStr;
+
+    #[test]
+    fn temporal_server_build_command_avoids_modfile_and_api_rewrites() {
+        let cmd = temporal_server_build_command(
+            "go",
+            Path::new("/tmp/temporal"),
+            Path::new("/tmp/temporal-server"),
+        );
+
+        assert_eq!(cmd.get_program(), OsStr::new("go"));
+
+        let args: Vec<String> = cmd
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(args.first().map(String::as_str), Some("build"));
+        assert!(args.iter().any(|arg| arg == "./cmd/server"));
+        assert!(args.iter().all(|arg| !arg.contains("-modfile")));
+        assert!(args
+            .iter()
+            .all(|arg| !arg.starts_with("go.temporal.io/api@")));
+
+        assert!(cmd.get_envs().all(|(key, _)| key != OsStr::new("GOFLAGS")));
     }
 }

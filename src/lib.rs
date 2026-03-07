@@ -8,10 +8,6 @@ use tonic::transport::Endpoint;
 use tonic::Code;
 use uuid::Uuid;
 
-pub mod blockdevicepb {
-    tonic::include_proto!("temporal.server.chasm.lib.blockdevice.proto.v1");
-}
-
 pub mod temporal {
     pub mod api {
         pub mod activity {
@@ -44,16 +40,6 @@ pub mod temporal {
                 tonic::include_proto!("temporal.api.enums.v1");
             }
         }
-        pub mod errordetails {
-            pub mod v1 {
-                tonic::include_proto!("temporal.api.errordetails.v1");
-            }
-        }
-        pub mod export {
-            pub mod v1 {
-                tonic::include_proto!("temporal.api.export.v1");
-            }
-        }
         pub mod failure {
             pub mod v1 {
                 tonic::include_proto!("temporal.api.failure.v1");
@@ -77,11 +63,6 @@ pub mod temporal {
         pub mod nexus {
             pub mod v1 {
                 tonic::include_proto!("temporal.api.nexus.v1");
-            }
-        }
-        pub mod operatorservice {
-            pub mod v1 {
-                tonic::include_proto!("temporal.api.operatorservice.v1");
             }
         }
         pub mod protocol {
@@ -145,6 +126,23 @@ pub mod temporal {
             }
         }
     }
+    pub mod server {
+        pub mod chasm {
+            pub mod lib {
+                pub mod blockdevice {
+                    pub mod proto {
+                        pub mod v1 {
+                            tonic::include_proto!("temporal.server.chasm.lib.blockdevice.proto.v1");
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+pub mod blockdevicepb {
+    pub use crate::temporal::server::chasm::lib::blockdevice::proto::v1::*;
 }
 
 pub mod workflowservicepb {
@@ -230,13 +228,8 @@ pub async fn run_phase1_create_volume_smoke(config: &SmokeConfig) -> anyhow::Res
 
     let mut client = BlockDeviceServiceClient::new(channel);
 
-    let first_request = CreateVolumeRequest {
-        namespace_id: config.namespace_id.clone(),
-        volume_id: config.volume_id.clone(),
-        size_bytes: config.size_bytes,
-        block_size_bytes: config.block_size_bytes,
-        request_id: format!("req-{}", Uuid::new_v4().simple()),
-    };
+    let first_request =
+        build_create_volume_request(config, format!("req-{}", Uuid::new_v4().simple()))?;
 
     let first_response = timeout(config.rpc_timeout, client.create_volume(first_request))
         .await
@@ -249,24 +242,10 @@ pub async fn run_phase1_create_volume_smoke(config: &SmokeConfig) -> anyhow::Res
         .context("first CreateVolume call failed")?
         .into_inner();
 
-    if first_response.volume_id != config.volume_id {
-        return Err(anyhow!(
-            "CreateVolume returned unexpected volume_id: got {}, want {}",
-            first_response.volume_id,
-            config.volume_id
-        ));
-    }
-    if first_response.run_id.is_empty() {
-        return Err(anyhow!("CreateVolume returned empty run_id"));
-    }
+    validate_first_create_volume_response(&first_response, &config.volume_id)?;
 
-    let second_request = CreateVolumeRequest {
-        namespace_id: config.namespace_id.clone(),
-        volume_id: config.volume_id.clone(),
-        size_bytes: config.size_bytes,
-        block_size_bytes: config.block_size_bytes,
-        request_id: format!("req-{}", Uuid::new_v4().simple()),
-    };
+    let second_request =
+        build_create_volume_request(config, format!("req-{}", Uuid::new_v4().simple()))?;
 
     let duplicate_result = timeout(config.rpc_timeout, client.create_volume(second_request))
         .await
@@ -304,6 +283,49 @@ fn normalize_endpoint(raw: &str) -> String {
     }
 }
 
+fn build_create_volume_request(
+    config: &SmokeConfig,
+    request_id: String,
+) -> anyhow::Result<CreateVolumeRequest> {
+    let size_bytes = i64::try_from(config.size_bytes)
+        .context("TEMPORAL_VOLUME_SIZE_BYTES must be <= i64::MAX")?;
+    let block_size_bytes = i32::try_from(config.block_size_bytes)
+        .context("TEMPORAL_VOLUME_BLOCK_SIZE_BYTES must be <= i32::MAX")?;
+
+    Ok(CreateVolumeRequest {
+        namespace_id: config.namespace_id.clone(),
+        frontend_request: Some(workflowservicepb::CreateVolumeRequest {
+            volume_id: config.volume_id.clone(),
+            size_bytes,
+            block_size_bytes,
+            request_id,
+            ..Default::default()
+        }),
+    })
+}
+
+fn validate_first_create_volume_response(
+    response: &blockdevicepb::CreateVolumeResponse,
+    expected_volume_id: &str,
+) -> anyhow::Result<()> {
+    let frontend_response = response
+        .frontend_response
+        .as_ref()
+        .ok_or_else(|| anyhow!("CreateVolume returned empty frontend_response"))?;
+
+    if frontend_response.volume_id != expected_volume_id {
+        return Err(anyhow!(
+            "CreateVolume returned unexpected volume_id: got {}, want {}",
+            frontend_response.volume_id,
+            expected_volume_id
+        ));
+    }
+    if frontend_response.run_id.is_empty() {
+        return Err(anyhow!("CreateVolume returned empty run_id"));
+    }
+    Ok(())
+}
+
 fn persist_volume_id(path: &Path, volume_id: &str) -> anyhow::Result<()> {
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
@@ -318,6 +340,27 @@ fn persist_volume_id(path: &Path, volume_id: &str) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn sample_config() -> SmokeConfig {
+        SmokeConfig {
+            history_endpoint: "127.0.0.1:7234".to_string(),
+            namespace_id: "namespace-id".to_string(),
+            volume_id: "volume-id".to_string(),
+            size_bytes: 1 << 30,
+            block_size_bytes: 4096,
+            volume_id_file: PathBuf::from("/tmp/volume-id.txt"),
+            connect_timeout: Duration::from_secs(3),
+            rpc_timeout: Duration::from_secs(5),
+        }
+    }
+
+    fn parse_go_directive(contents: &str) -> Option<String> {
+        contents
+            .lines()
+            .map(str::trim)
+            .find_map(|line| line.strip_prefix("go ").map(str::trim))
+            .map(ToString::to_string)
+    }
 
     #[test]
     fn normalize_endpoint_adds_http_when_missing() {
@@ -349,5 +392,78 @@ mod tests {
         let content = fs::read_to_string(&out).expect("must read written file");
         assert_eq!(content, "volume-abc\n");
         fs::remove_file(out).ok();
+    }
+
+    #[test]
+    fn build_create_volume_request_wraps_frontend_request() {
+        let config = sample_config();
+        let request = build_create_volume_request(&config, "req-123".to_string())
+            .expect("request should build");
+
+        assert_eq!(request.namespace_id, config.namespace_id);
+        let frontend = request
+            .frontend_request
+            .expect("frontend request should be present");
+        assert_eq!(frontend.volume_id, config.volume_id);
+        assert_eq!(frontend.size_bytes, config.size_bytes as i64);
+        assert_eq!(frontend.block_size_bytes, config.block_size_bytes as i32);
+        assert_eq!(frontend.request_id, "req-123");
+    }
+
+    #[test]
+    fn validate_first_create_volume_response_rejects_missing_frontend_response() {
+        let response = blockdevicepb::CreateVolumeResponse {
+            frontend_response: None,
+        };
+
+        let err = validate_first_create_volume_response(&response, "volume-id")
+            .expect_err("missing frontend response must fail");
+        assert!(err.to_string().contains("empty frontend_response"));
+    }
+
+    #[test]
+    fn workspace_go_version_matches_temporal_go_mod() {
+        let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .canonicalize()
+            .expect("repo root should resolve");
+
+        let go_work_contents =
+            fs::read_to_string(repo_root.join("go.work")).expect("go.work should exist");
+        let temporal_go_mod_contents = fs::read_to_string(repo_root.join("temporal/go.mod"))
+            .expect("temporal/go.mod should exist");
+
+        let workspace_go =
+            parse_go_directive(&go_work_contents).expect("go.work must define a go directive");
+        let module_go = parse_go_directive(&temporal_go_mod_contents)
+            .expect("temporal/go.mod must define a go directive");
+
+        assert_eq!(
+            workspace_go, module_go,
+            "go.work and temporal/go.mod must use the same go directive",
+        );
+    }
+
+    #[test]
+    fn generated_proto_set_excludes_unneeded_api_packages() {
+        let out_dir = PathBuf::from(env!("OUT_DIR"));
+
+        assert!(out_dir.join("temporal.api.workflowservice.v1.rs").exists());
+        assert!(out_dir
+            .join("temporal.server.chasm.lib.blockdevice.proto.v1.rs")
+            .exists());
+
+        assert!(
+            !out_dir.join("temporal.api.operatorservice.v1.rs").exists(),
+            "operatorservice proto should not be generated for phase1 client",
+        );
+        assert!(
+            !out_dir.join("temporal.api.export.v1.rs").exists(),
+            "export proto should not be generated for phase1 client",
+        );
+        assert!(
+            !out_dir.join("temporal.api.errordetails.v1.rs").exists(),
+            "errordetails proto should not be generated for phase1 client",
+        );
     }
 }

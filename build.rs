@@ -1,6 +1,5 @@
 use std::env;
-use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 fn temporal_repo_root() -> PathBuf {
     const REQUIRED: &str = "chasm/lib/blockdevice/proto/v1/service.proto";
@@ -56,30 +55,6 @@ fn temporal_api_repo_root() -> PathBuf {
     );
 }
 
-fn collect_proto_files(root: &Path) -> Vec<PathBuf> {
-    let mut files = Vec::new();
-    let mut stack = vec![root.to_path_buf()];
-
-    while let Some(dir) = stack.pop() {
-        let entries = fs::read_dir(&dir)
-            .unwrap_or_else(|err| panic!("failed to read proto dir {}: {err}", dir.display()));
-        for entry in entries {
-            let entry = entry.unwrap_or_else(|err| {
-                panic!("failed to iterate proto dir {}: {err}", dir.display())
-            });
-            let path = entry.path();
-            if path.is_dir() {
-                stack.push(path);
-            } else if path.extension().is_some_and(|ext| ext == "proto") {
-                files.push(path);
-            }
-        }
-    }
-
-    files.sort();
-    files
-}
-
 fn main() {
     println!("cargo:rerun-if-env-changed=TEMPORAL_REPO");
     println!("cargo:rerun-if-env-changed=TEMPORAL_API_REPO");
@@ -91,9 +66,14 @@ fn main() {
     let message_proto = repo.join("chasm/lib/blockdevice/proto/v1/message.proto");
     let routing_extension_proto =
         repo.join("proto/internal/temporal/server/api/routing/v1/extension.proto");
-    let api_proto_root = api_repo.join("temporal/api");
-    let mut proto_inputs = vec![blockdevice_service_proto.clone()];
-    proto_inputs.extend(collect_proto_files(&api_proto_root));
+    let workflow_service_proto = api_repo.join("temporal/api/workflowservice/v1/service.proto");
+    let workflow_request_response_proto =
+        api_repo.join("temporal/api/workflowservice/v1/request_response.proto");
+    let proto_inputs = vec![
+        blockdevice_service_proto.clone(),
+        workflow_service_proto.clone(),
+        workflow_request_response_proto.clone(),
+    ];
 
     println!(
         "cargo:rerun-if-changed={}",
@@ -108,10 +88,14 @@ fn main() {
         "cargo:rerun-if-changed={}",
         routing_extension_proto.display()
     );
-    for proto in proto_inputs.iter().skip(1) {
-        println!("cargo:rerun-if-changed={}", proto.display());
-    }
-    println!("cargo:rerun-if-changed={}", api_repo.display());
+    println!(
+        "cargo:rerun-if-changed={}",
+        workflow_service_proto.display()
+    );
+    println!(
+        "cargo:rerun-if-changed={}",
+        workflow_request_response_proto.display()
+    );
 
     tonic_build::configure()
         .build_server(false)
