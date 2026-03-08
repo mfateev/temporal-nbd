@@ -2,6 +2,10 @@
 
 Rust client for Temporal CHASM blockdevice over `workflowservice`.
 
+See also:
+- `DESIGN.md` for architecture.
+- `CONTRIBUTING.md` for branch pairing, build, and remote test workflows.
+
 ## Modes
 
 - `smoke` (default): Create/Open/Write/Read contract validation against frontend `workflowservice`.
@@ -15,6 +19,7 @@ Rust client for Temporal CHASM blockdevice over `workflowservice`.
 - NBD kernel module loaded (`sudo modprobe nbd max_part=0`).
 - NBD device node available (for example `/dev/nbd0`).
 - Permission to open/configure `/dev/nbdX` (typically root).
+- Build-time proto source: set `TEMPORAL_API_REPO` only when compiling if your API checkout is not at `../api`.
 
 ## Smoke Mode
 
@@ -31,7 +36,6 @@ Optional env:
 - `TEMPORAL_VOLUME_ID_FILE` (default: `./phase2-volume-id.txt`)
 - `TEMPORAL_CONNECT_TIMEOUT_SECS` (default: `5`)
 - `TEMPORAL_RPC_TIMEOUT_SECS` (default: `5`)
-- `TEMPORAL_API_REPO` path to Temporal API repo (default: `../api`)
 
 Run:
 
@@ -56,6 +60,90 @@ sudo cargo run -- attach \
   --volume-id my-volume \
   --nbd-device /dev/nbd0
 ```
+
+## Using Precompiled Binaries
+
+If you already have a built `temporal-nbd` binary, use it directly instead of `cargo run`.
+
+Example:
+
+```bash
+export TEMPORAL_NBD_BIN=/path/to/temporal-nbd
+export TEMPORAL_FRONTEND_ENDPOINT=127.0.0.1:7233
+export TEMPORAL_NAMESPACE=default
+export TEMPORAL_VOLUME_ID=my-volume
+
+# Smoke
+"$TEMPORAL_NBD_BIN" smoke
+
+# Attach
+sudo "$TEMPORAL_NBD_BIN" attach \
+  --frontend-endpoint "$TEMPORAL_FRONTEND_ENDPOINT" \
+  --namespace "$TEMPORAL_NAMESPACE" \
+  --volume-id "$TEMPORAL_VOLUME_ID" \
+  --nbd-device /dev/nbd0
+```
+
+If you built locally with Cargo, the binary is usually at:
+- `target/debug/temporal-nbd`
+- `target/release/temporal-nbd`
+
+## Use the Device End-to-End
+
+Example workflow for `/dev/nbd0`:
+
+1. Load NBD support and choose a volume ID.
+
+```bash
+sudo modprobe nbd max_part=0
+export TEMPORAL_FRONTEND_ENDPOINT=127.0.0.1:7233
+export TEMPORAL_NAMESPACE=default
+export TEMPORAL_VOLUME_ID=my-volume
+```
+
+2. Create/open the volume once (smoke mode does this and validates API behavior).
+
+```bash
+cargo run -- smoke
+```
+
+3. Start attach mode in terminal A.
+
+```bash
+sudo cargo run -- attach \
+  --frontend-endpoint "$TEMPORAL_FRONTEND_ENDPOINT" \
+  --namespace "$TEMPORAL_NAMESPACE" \
+  --volume-id "$TEMPORAL_VOLUME_ID" \
+  --nbd-device /dev/nbd0
+```
+
+4. Format, mount, and write data in terminal B.
+
+```bash
+sudo mkfs.ext4 -F /dev/nbd0
+sudo mkdir -p /mnt/temporal-nbd
+sudo mount /dev/nbd0 /mnt/temporal-nbd
+sudo chown "$(id -u):$(id -g)" /mnt/temporal-nbd
+echo "hello from temporal-nbd" > /mnt/temporal-nbd/hello.txt
+sync
+sudo umount /mnt/temporal-nbd
+```
+
+5. Detach by stopping attach mode (`Ctrl-C` in terminal A), then re-attach and verify.
+
+```bash
+sudo cargo run -- attach \
+  --frontend-endpoint "$TEMPORAL_FRONTEND_ENDPOINT" \
+  --namespace "$TEMPORAL_NAMESPACE" \
+  --volume-id "$TEMPORAL_VOLUME_ID" \
+  --nbd-device /dev/nbd0
+
+sudo mount /dev/nbd0 /mnt/temporal-nbd
+cat /mnt/temporal-nbd/hello.txt
+sudo umount /mnt/temporal-nbd
+```
+
+`attach` is single-volume-per-process and intended for one active writer per volume in this POC.
 
 Attach flags (all also support env vars):
 
@@ -89,7 +177,7 @@ Attach flags (all also support env vars):
 cargo test
 cargo test --test create_volume_smoke -- --nocapture
 cargo test --test e2e_sqlite -- --ignored --nocapture
-# kernel-gated: attach + mkfs + mount + unmount + remount roundtrip
+# kernel-gated: attach + mkfs + mount + write + unmount + detach + re-attach + remount verify
 cargo test --test e2e_nbd_mount -- --ignored --nocapture
 ```
 
