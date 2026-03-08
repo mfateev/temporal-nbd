@@ -10,7 +10,7 @@ use temporal_nbd::workflowservicepb::{
     workflow_service_client::WorkflowServiceClient, DescribeNamespaceRequest,
     RegisterNamespaceRequest,
 };
-use temporal_nbd::{run_phase1_create_volume_smoke, SmokeConfig};
+use temporal_nbd::{run_phase2_workflowservice_smoke, SmokeConfig};
 use tokio::time::{sleep, timeout};
 use tonic::transport::Endpoint;
 use tonic::Code;
@@ -18,24 +18,21 @@ use uuid::Uuid;
 
 #[tokio::test]
 #[ignore = "builds and runs source temporal-server with development-sqlite"]
-async fn phase1_e2e_sqlite_source_server() -> anyhow::Result<()> {
-    timeout(Duration::from_secs(240), run_phase1_e2e())
+async fn phase2_e2e_sqlite_source_server() -> anyhow::Result<()> {
+    timeout(Duration::from_secs(240), run_phase2_e2e())
         .await
-        .context("phase1 e2e test timed out")?
+        .context("phase2 e2e test timed out")?
 }
 
-async fn run_phase1_e2e() -> anyhow::Result<()> {
+async fn run_phase2_e2e() -> anyhow::Result<()> {
     let temporal_repo = temporal_repo_root()?;
 
     let frontend_endpoint =
         env::var("TEMPORAL_FRONTEND_ENDPOINT").unwrap_or_else(|_| "127.0.0.1:7233".to_string());
-    let history_endpoint =
-        env::var("TEMPORAL_HISTORY_ENDPOINT").unwrap_or_else(|_| "127.0.0.1:7234".to_string());
     let server_env =
         env::var("TEMPORAL_SERVER_ENV").unwrap_or_else(|_| "development-sqlite".to_string());
 
     ensure_endpoint_free(&frontend_endpoint, "frontend")?;
-    ensure_endpoint_free(&history_endpoint, "history")?;
 
     let run_suffix = Uuid::new_v4().simple().to_string();
     let server_bin = env::temp_dir().join(format!("temporal-server-rust-e2e-{run_suffix}"));
@@ -52,23 +49,16 @@ async fn run_phase1_e2e() -> anyhow::Result<()> {
         Duration::from_secs(45),
     )
     .await?;
-    wait_for_endpoint(
-        &mut server,
-        &history_endpoint,
-        "history",
-        Duration::from_secs(45),
-    )
-    .await?;
 
     let namespace_name = format!("blockdevice-rust-e2e-{run_suffix}");
-    let namespace_id = register_and_describe_namespace(&frontend_endpoint, &namespace_name).await?;
+    register_and_describe_namespace(&frontend_endpoint, &namespace_name).await?;
 
     let volume_id = format!("phase1-e2e-sqlite-{run_suffix}");
     let volume_id_file = env::temp_dir().join(format!("phase1-e2e-volume-id-{run_suffix}.txt"));
 
     let config = SmokeConfig {
-        history_endpoint,
-        namespace_id,
+        frontend_endpoint,
+        namespace: namespace_name.clone(),
         volume_id: volume_id.clone(),
         size_bytes: 1 << 30,
         block_size_bytes: 0,
@@ -77,9 +67,9 @@ async fn run_phase1_e2e() -> anyhow::Result<()> {
         rpc_timeout: Duration::from_secs(5),
     };
 
-    run_phase1_create_volume_smoke(&config)
+    run_phase2_workflowservice_smoke(&config)
         .await
-        .context("phase1 create-volume smoke flow failed")?;
+        .context("phase2 workflowservice smoke flow failed")?;
 
     let persisted = fs::read_to_string(&volume_id_file)
         .with_context(|| format!("failed to read {}", volume_id_file.display()))?;
