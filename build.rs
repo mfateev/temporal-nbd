@@ -1,54 +1,59 @@
 use std::env;
 use std::path::PathBuf;
 
-fn temporal_repo_root() -> PathBuf {
-    if let Ok(path) = env::var("TEMPORAL_REPO") {
-        return PathBuf::from(path);
+fn temporal_api_repo_root() -> PathBuf {
+    const REQUIRED: &str = "temporal/api/workflowservice/v1/service.proto";
+
+    if let Ok(path) = env::var("TEMPORAL_API_REPO") {
+        let candidate = PathBuf::from(path);
+        if candidate.join(REQUIRED).exists() {
+            return candidate;
+        }
+        panic!(
+            "TEMPORAL_API_REPO does not contain {} (path: {})",
+            REQUIRED,
+            candidate.display()
+        );
     }
 
     let manifest_dir =
         PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR must be set"));
-    let default = manifest_dir.join("../temporal");
-    if default.exists() {
+    let default = manifest_dir.join("../api");
+    if default.join(REQUIRED).exists() {
         return default;
     }
 
     panic!(
-        "Temporal repo not found. Set TEMPORAL_REPO to a checkout containing chasm/lib/blockdevice/proto/v1/service.proto"
+        "Temporal API repo not found. Set TEMPORAL_API_REPO to a checkout containing temporal/api/workflowservice/v1/service.proto"
     );
 }
 
 fn main() {
-    println!("cargo:rerun-if-env-changed=TEMPORAL_REPO");
+    println!("cargo:rerun-if-env-changed=TEMPORAL_API_REPO");
 
-    let repo = temporal_repo_root();
-    let service_proto = repo.join("chasm/lib/blockdevice/proto/v1/service.proto");
-    let request_response_proto = repo.join("chasm/lib/blockdevice/proto/v1/request_response.proto");
-    let message_proto = repo.join("chasm/lib/blockdevice/proto/v1/message.proto");
-    let routing_extension_proto =
-        repo.join("proto/internal/temporal/server/api/routing/v1/extension.proto");
+    let api_repo = temporal_api_repo_root();
+    let workflow_service_proto = api_repo.join("temporal/api/workflowservice/v1/service.proto");
+    let workflow_request_response_proto =
+        api_repo.join("temporal/api/workflowservice/v1/request_response.proto");
 
-    println!("cargo:rerun-if-changed={}", service_proto.display());
     println!(
         "cargo:rerun-if-changed={}",
-        request_response_proto.display()
+        workflow_service_proto.display()
     );
-    println!("cargo:rerun-if-changed={}", message_proto.display());
     println!(
         "cargo:rerun-if-changed={}",
-        routing_extension_proto.display()
+        workflow_request_response_proto.display()
     );
 
     tonic_build::configure()
         .build_server(false)
         .compile(
-            &[service_proto],
+            &[workflow_service_proto],
             &[
-                repo.clone(),
-                repo.join("proto/internal"),
+                api_repo,
                 PathBuf::from("/usr/include"),
                 PathBuf::from("/usr/local/include"),
             ],
         )
-        .expect("failed to compile blockdevice protos");
+        .expect("failed to compile workflowservice protos");
 }
