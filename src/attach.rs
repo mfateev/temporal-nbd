@@ -18,6 +18,7 @@ pub struct AttachConfig {
     pub retry_max_attempts: usize,
     pub retry_initial_backoff: Duration,
     pub retry_max_backoff: Duration,
+    pub retry_jitter_ratio: f64,
     pub dirty_high_watermark_blocks: usize,
     pub flush_retry_deadline: Duration,
     pub flush_retry_interval: Duration,
@@ -32,7 +33,7 @@ pub async fn run_attach(config: AttachConfig) -> anyhow::Result<()> {
         max_attempts: config.retry_max_attempts,
         initial_backoff: config.retry_initial_backoff,
         max_backoff: config.retry_max_backoff,
-        jitter_ratio: 0.2,
+        jitter_ratio: config.retry_jitter_ratio,
     };
 
     let session = VolumeSession::connect_and_open(VolumeSessionConfig {

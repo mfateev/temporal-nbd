@@ -55,6 +55,9 @@ struct AttachArgs {
     #[arg(long, env = "TEMPORAL_RETRY_MAX_BACKOFF_MS", default_value_t = 2000)]
     retry_max_backoff_ms: u64,
 
+    #[arg(long, env = "TEMPORAL_RETRY_JITTER_RATIO", default_value_t = 0.2)]
+    retry_jitter_ratio: f64,
+
     #[arg(long, env = "TEMPORAL_DIRTY_HIGH_WATER_BLOCKS", default_value_t = 4096)]
     dirty_high_water_blocks: usize,
 
@@ -83,6 +86,7 @@ impl From<AttachArgs> for temporal_nbd::attach::AttachConfig {
             retry_max_attempts: value.retry_max_attempts,
             retry_initial_backoff: Duration::from_millis(value.retry_initial_backoff_ms),
             retry_max_backoff: Duration::from_millis(value.retry_max_backoff_ms),
+            retry_jitter_ratio: value.retry_jitter_ratio,
             dirty_high_watermark_blocks: value.dirty_high_water_blocks,
             flush_retry_deadline: Duration::from_secs(value.flush_retry_deadline_secs),
             flush_retry_interval: Duration::from_millis(value.flush_retry_interval_ms),

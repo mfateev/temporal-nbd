@@ -168,29 +168,25 @@ impl<T: BackendTransport> CachingBlockEngine<T> {
             return Ok(());
         }
 
-        // Clone current dirty state so failed attempts keep dirty data intact.
-        let ordered_dirty: Vec<(u64, Vec<u8>)> = self
-            .dirty
-            .iter()
-            .map(|(lba, data)| (*lba, data.clone()))
-            .collect();
-
-        for chunk in ordered_dirty.chunks(usize::try_from(MAX_BLOCKS_PER_RPC).expect("const fits"))
-        {
-            let writes: Vec<BlockWrite> = chunk
-                .iter()
-                .map(|(lba, data)| BlockWrite {
+        let chunk_limit = usize::try_from(MAX_BLOCKS_PER_RPC).expect("const fits");
+        while !self.dirty.is_empty() {
+            let mut flushed_lbas = Vec::with_capacity(chunk_limit);
+            let mut writes = Vec::with_capacity(chunk_limit);
+            for (lba, data) in self.dirty.iter().take(chunk_limit) {
+                flushed_lbas.push(*lba);
+                writes.push(BlockWrite {
                     lba: *lba,
                     data: data.clone(),
-                })
-                .collect();
-
+                });
+            }
             if let Err(err) = self.transport.write_batch(&writes).await {
                 return Err(Self::map_transport(err));
             }
+            for lba in flushed_lbas {
+                let removed = self.dirty.remove(&lba);
+                debug_assert!(removed.is_some(), "dirty cache entry unexpectedly missing");
+            }
         }
-
-        self.dirty.clear();
         Ok(())
     }
 
@@ -339,6 +335,8 @@ mod tests {
         backend: BTreeMap<u64, Vec<u8>>,
         read_calls: Vec<(u64, u32)>,
         write_batches: Vec<Vec<u64>>,
+        write_calls: usize,
+        fail_on_write_calls: VecDeque<usize>,
         fail_writes: VecDeque<TransportError>,
         disconnected: bool,
     }
@@ -350,6 +348,8 @@ mod tests {
                 backend: BTreeMap::new(),
                 read_calls: Vec::new(),
                 write_batches: Vec::new(),
+                write_calls: 0,
+                fail_on_write_calls: VecDeque::new(),
                 fail_writes: VecDeque::new(),
                 disconnected: false,
             }
@@ -386,8 +386,21 @@ mod tests {
         }
 
         async fn write_batch(&mut self, writes: &[BlockWrite]) -> Result<(), TransportError> {
-            if let Some(err) = self.fail_writes.pop_front() {
-                return Err(err);
+            self.write_calls = self.write_calls.saturating_add(1);
+
+            if self.fail_on_write_calls.is_empty() {
+                if let Some(err) = self.fail_writes.pop_front() {
+                    return Err(err);
+                }
+            } else if self
+                .fail_on_write_calls
+                .front()
+                .is_some_and(|call| *call == self.write_calls)
+            {
+                self.fail_on_write_calls.pop_front();
+                if let Some(err) = self.fail_writes.pop_front() {
+                    return Err(err);
+                }
             }
 
             self.write_batches
@@ -535,6 +548,48 @@ mod tests {
         assert_eq!(engine.dirty_count(), 0);
         let transport = engine.into_transport();
         assert_eq!(transport.write_batches.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn flush_retries_only_failed_tail_chunk() {
+        let mut payload = Vec::new();
+        for i in 0_u32..700 {
+            payload.extend_from_slice(&i.to_le_bytes());
+        }
+
+        let mut transport = MockTransport::new(4);
+        transport.fail_on_write_calls.push_back(2);
+        transport
+            .fail_writes
+            .push_back(TransportError::retryable("second chunk transient error"));
+
+        let mut engine = CachingBlockEngine::new(
+            geometry(4, 2000),
+            transport,
+            EngineConfig {
+                dirty_high_watermark_blocks: 4096,
+                flush_retry_deadline: Duration::from_millis(50),
+                flush_retry_interval: Duration::from_millis(1),
+            },
+        );
+
+        engine
+            .write_blocks(0, &payload)
+            .await
+            .expect("write succeeds");
+        engine
+            .flush()
+            .await
+            .expect("flush should eventually succeed");
+
+        let transport = engine.into_transport();
+        assert_eq!(transport.write_batches.len(), 2);
+        assert_eq!(transport.write_batches[0].len(), 512);
+        assert_eq!(transport.write_batches[1].len(), 188);
+        assert_eq!(transport.write_batches[0][0], 0);
+        assert_eq!(transport.write_batches[0][511], 511);
+        assert_eq!(transport.write_batches[1][0], 512);
+        assert_eq!(transport.write_batches[1][187], 699);
     }
 
     #[tokio::test]

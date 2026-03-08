@@ -10,6 +10,9 @@ use tokio::time::{sleep, timeout};
 use tonic::transport::Endpoint;
 use tonic::Code;
 
+// Keep WriteBatch requests conservative to avoid overflowing Temporal workflow mutable state.
+const MAX_WRITES_PER_WRITE_BATCH_RPC: usize = 64;
+
 #[derive(Clone, Debug)]
 pub struct RetryConfig {
     pub max_attempts: usize,
@@ -71,6 +74,9 @@ pub struct VolumeSession {
     endpoint_url: String,
     client: Option<WorkflowServiceClient>,
     geometry: VolumeGeometry,
+    write_rpc_sent: u64,
+    write_payload_bytes_sent: u64,
+    write_blocks_sent: u64,
 }
 
 impl VolumeSession {
@@ -134,6 +140,9 @@ impl VolumeSession {
                         endpoint_url,
                         client: Some(client),
                         geometry,
+                        write_rpc_sent: 0,
+                        write_payload_bytes_sent: 0,
+                        write_blocks_sent: 0,
                     });
                 }
                 Ok(Err(status)) => {
@@ -240,10 +249,13 @@ impl VolumeSession {
         ))
     }
 
-    async fn run_write_batch_with_retry(
+    async fn run_write_batch_rpc_with_retry(
         &mut self,
         writes: &[BlockWrite],
     ) -> Result<(), TransportError> {
+        let Some((payload_bytes, min_lba, max_lba)) = summarize_writes(writes) else {
+            return Ok(());
+        };
         let attempts = self.config.retry.capped_attempts();
 
         for attempt in 1..=attempts {
@@ -266,6 +278,20 @@ impl VolumeSession {
                     })
                     .collect(),
             };
+            let request_encoded_len = prost::Message::encoded_len(&request);
+            if attempt == 1 {
+                eprintln!(
+                    "write_batch send: writes={} payload_bytes={} request_bytes={} lba_range=[{}..={}] totals_before[rpc={},payload_bytes={},blocks={}]",
+                    writes.len(),
+                    payload_bytes,
+                    request_encoded_len,
+                    min_lba,
+                    max_lba,
+                    self.write_rpc_sent,
+                    self.write_payload_bytes_sent,
+                    self.write_blocks_sent
+                );
+            }
 
             let result = {
                 let client = self.client.as_mut().expect("client should be initialized");
@@ -273,9 +299,31 @@ impl VolumeSession {
             };
 
             match result {
-                Ok(Ok(_response)) => return Ok(()),
+                Ok(Ok(_response)) => {
+                    self.write_rpc_sent = self.write_rpc_sent.saturating_add(1);
+                    self.write_payload_bytes_sent = self
+                        .write_payload_bytes_sent
+                        .saturating_add(u64::try_from(payload_bytes).unwrap_or(u64::MAX));
+                    self.write_blocks_sent = self
+                        .write_blocks_sent
+                        .saturating_add(u64::try_from(writes.len()).unwrap_or(u64::MAX));
+                    return Ok(());
+                }
                 Ok(Err(status)) => {
                     let retryable = is_retryable_status(status.code());
+                    eprintln!(
+                        "write_batch failure: attempt={}/{} retryable={} code={} message={} writes={} payload_bytes={} request_bytes={} lba_range=[{}..={}]",
+                        attempt,
+                        attempts,
+                        retryable,
+                        status.code(),
+                        status.message(),
+                        writes.len(),
+                        payload_bytes,
+                        request_encoded_len,
+                        min_lba,
+                        max_lba
+                    );
                     self.client = None;
                     if retryable && attempt < attempts {
                         sleep(self.config.retry.delay_for_attempt(attempt)).await;
@@ -284,6 +332,16 @@ impl VolumeSession {
                     return Err(status_to_transport("WriteBatch", status, retryable));
                 }
                 Err(_) => {
+                    eprintln!(
+                        "write_batch timeout: attempt={}/{} writes={} payload_bytes={} request_bytes={} lba_range=[{}..={}]",
+                        attempt,
+                        attempts,
+                        writes.len(),
+                        payload_bytes,
+                        request_encoded_len,
+                        min_lba,
+                        max_lba
+                    );
                     self.client = None;
                     if attempt < attempts {
                         sleep(self.config.retry.delay_for_attempt(attempt)).await;
@@ -300,6 +358,20 @@ impl VolumeSession {
         Err(TransportError::retryable(
             "WriteBatch exhausted retry loop unexpectedly",
         ))
+    }
+
+    async fn run_write_batch_with_retry(
+        &mut self,
+        writes: &[BlockWrite],
+    ) -> Result<(), TransportError> {
+        if writes.is_empty() {
+            return Ok(());
+        }
+
+        for chunk in writes.chunks(MAX_WRITES_PER_WRITE_BATCH_RPC) {
+            self.run_write_batch_rpc_with_retry(chunk).await?;
+        }
+        Ok(())
     }
 }
 
@@ -369,4 +441,19 @@ fn normalize_endpoint(raw: &str) -> String {
     } else {
         format!("http://{raw}")
     }
+}
+
+fn summarize_writes(writes: &[BlockWrite]) -> Option<(usize, u64, u64)> {
+    if writes.is_empty() {
+        return None;
+    }
+    let mut payload_bytes = 0_usize;
+    let mut min_lba = u64::MAX;
+    let mut max_lba = 0_u64;
+    for write in writes {
+        payload_bytes = payload_bytes.saturating_add(write.data.len());
+        min_lba = min_lba.min(write.lba);
+        max_lba = max_lba.max(write.lba);
+    }
+    Some((payload_bytes, min_lba, max_lba))
 }

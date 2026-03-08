@@ -61,11 +61,13 @@ async fn run_phase2_e2e_nbd_attach_mount_roundtrip() -> anyhow::Result<()> {
     assert_program_exists_for_mode(&privilege, "mount")?;
     assert_program_exists_for_mode(&privilege, "umount")?;
     assert_program_exists_for_mode(&privilege, "blockdev")?;
+    assert_program_exists_for_mode(&privilege, "dd")?;
 
     let volume_size_bytes = env::var("TEMPORAL_VOLUME_SIZE_BYTES")
         .ok()
         .and_then(|raw| raw.parse::<u64>().ok())
-        .unwrap_or(256 * 1024 * 1024);
+        // Keep default geometry within current Temporal mutable-state limits for CHASM block storage.
+        .unwrap_or(32 * 1024 * 1024);
 
     let create_config = SmokeConfig {
         frontend_endpoint: frontend_endpoint.clone(),
@@ -109,11 +111,21 @@ async fn run_phase2_e2e_nbd_attach_mount_roundtrip() -> anyhow::Result<()> {
             Duration::from_secs(30),
         )?;
 
+        verify_raw_block_roundtrip(&privilege, &device_path)?;
+
         let mkfs_result = run_privileged_command(
             &privilege,
             "mkfs.ext4",
             |cmd| {
-                cmd.arg("-F").arg(&device_path);
+                cmd.arg("-F")
+                    // Disable ext4 journal to keep write amplification below current Temporal mutable-state limits.
+                    .arg("-O")
+                    .arg("^has_journal")
+                    .arg("-E")
+                    .arg("lazy_itable_init=1")
+                    .arg("-N")
+                    .arg("2048")
+                    .arg(&device_path);
             },
             "mkfs.ext4 on attached nbd device",
         )?;
@@ -137,9 +149,41 @@ async fn run_phase2_e2e_nbd_attach_mount_roundtrip() -> anyhow::Result<()> {
         )?;
 
         let payload_path = mount_dir.join("roundtrip.bin");
-        let payload = deterministic_payload(512 * 1024);
+        let payload = deterministic_payload(256 * 1024);
         fs::write(&payload_path, &payload)
             .with_context(|| format!("failed to write payload to {}", payload_path.display()))?;
+
+        let folder_path = mount_dir.join("folder-ops");
+        fs::create_dir_all(&folder_path)
+            .with_context(|| format!("failed to create folder {}", folder_path.display()))?;
+
+        let nested_file_path = folder_path.join("nested.bin");
+        let nested_payload = deterministic_payload(64 * 1024);
+        fs::write(&nested_file_path, &nested_payload).with_context(|| {
+            format!(
+                "failed to write nested payload to {}",
+                nested_file_path.display()
+            )
+        })?;
+
+        let copied_file_path = folder_path.join("nested-copy.bin");
+        let copied_bytes = fs::copy(&nested_file_path, &copied_file_path).with_context(|| {
+            format!(
+                "failed to copy nested payload from {} to {}",
+                nested_file_path.display(),
+                copied_file_path.display()
+            )
+        })?;
+        if copied_bytes
+            != u64::try_from(nested_payload.len()).expect("usize len should fit into u64")
+        {
+            bail!(
+                "copied size mismatch for {}: copied {} bytes, expected {} bytes",
+                copied_file_path.display(),
+                copied_bytes,
+                nested_payload.len()
+            );
+        }
 
         run_privileged_command(
             &privilege,
@@ -160,6 +204,32 @@ async fn run_phase2_e2e_nbd_attach_mount_roundtrip() -> anyhow::Result<()> {
             bail!(
                 "payload mismatch after unmount/remount roundtrip ({} bytes)",
                 payload.len()
+            );
+        }
+
+        let nested_roundtrip = fs::read(&nested_file_path).with_context(|| {
+            format!(
+                "failed to read nested payload from {}",
+                nested_file_path.display()
+            )
+        })?;
+        if nested_roundtrip != nested_payload {
+            bail!(
+                "nested payload mismatch after unmount/remount roundtrip ({} bytes)",
+                nested_payload.len()
+            );
+        }
+
+        let copied_roundtrip = fs::read(&copied_file_path).with_context(|| {
+            format!(
+                "failed to read copied payload from {}",
+                copied_file_path.display()
+            )
+        })?;
+        if copied_roundtrip != nested_payload {
+            bail!(
+                "copied payload mismatch after unmount/remount roundtrip ({} bytes)",
+                nested_payload.len()
             );
         }
 
@@ -189,6 +259,68 @@ fn deterministic_payload(len: usize) -> Vec<u8> {
         out.push(((i * 31) % 251) as u8);
     }
     out
+}
+
+fn verify_raw_block_roundtrip(privilege: &PrivilegeMode, device_path: &Path) -> anyhow::Result<()> {
+    const BLOCK_SIZE: usize = 4096;
+    const TEST_LBA: usize = 256;
+
+    let suffix = Uuid::new_v4().simple().to_string();
+    let src_path = env::temp_dir().join(format!("temporal-nbd-raw-src-{suffix}.bin"));
+    let readback_path = env::temp_dir().join(format!("temporal-nbd-raw-readback-{suffix}.bin"));
+    let payload = deterministic_payload(BLOCK_SIZE);
+    fs::write(&src_path, &payload)
+        .with_context(|| format!("failed to write raw test payload {}", src_path.display()))?;
+
+    let result = (|| -> anyhow::Result<()> {
+        run_privileged_command(
+            privilege,
+            "dd",
+            |cmd| {
+                cmd.arg(format!("if={}", src_path.display()))
+                    .arg(format!("of={}", device_path.display()))
+                    .arg(format!("bs={BLOCK_SIZE}"))
+                    .arg(format!("seek={TEST_LBA}"))
+                    .arg("count=1")
+                    .arg("conv=fsync,notrunc")
+                    .arg("status=none");
+            },
+            "write raw block via dd",
+        )?;
+
+        run_privileged_command(
+            privilege,
+            "dd",
+            |cmd| {
+                cmd.arg(format!("if={}", device_path.display()))
+                    .arg(format!("of={}", readback_path.display()))
+                    .arg(format!("bs={BLOCK_SIZE}"))
+                    .arg(format!("skip={TEST_LBA}"))
+                    .arg("count=1")
+                    .arg("status=none");
+            },
+            "read raw block via dd",
+        )?;
+
+        let readback = fs::read(&readback_path).with_context(|| {
+            format!(
+                "failed to read raw roundtrip output {}",
+                readback_path.display()
+            )
+        })?;
+        if readback != payload {
+            bail!(
+                "raw block roundtrip mismatch at lba {} ({} bytes)",
+                TEST_LBA,
+                BLOCK_SIZE
+            );
+        }
+        Ok(())
+    })();
+
+    let _ = fs::remove_file(&src_path);
+    let _ = fs::remove_file(&readback_path);
+    result
 }
 
 async fn ensure_volume_exists(config: &SmokeConfig) -> anyhow::Result<()> {

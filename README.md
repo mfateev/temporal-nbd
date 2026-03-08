@@ -66,6 +66,7 @@ Attach flags (all also support env vars):
 - `--retry-max-attempts` / `TEMPORAL_RETRY_MAX_ATTEMPTS` (default `8`)
 - `--retry-initial-backoff-ms` / `TEMPORAL_RETRY_INITIAL_BACKOFF_MS` (default `150`)
 - `--retry-max-backoff-ms` / `TEMPORAL_RETRY_MAX_BACKOFF_MS` (default `2000`)
+- `--retry-jitter-ratio` / `TEMPORAL_RETRY_JITTER_RATIO` (default `0.2`)
 - `--dirty-high-water-blocks` / `TEMPORAL_DIRTY_HIGH_WATER_BLOCKS` (default `4096`)
 - `--flush-retry-deadline-secs` / `TEMPORAL_FLUSH_RETRY_DEADLINE_SECS` (default `20`)
 - `--flush-retry-interval-ms` / `TEMPORAL_FLUSH_RETRY_INTERVAL_MS` (default `200`)
@@ -76,7 +77,7 @@ Attach flags (all also support env vars):
 
 - Dirty cache is keyed by LBA and coalesces overwrite writes (last write wins).
 - Reads fetch backend blocks and overlay dirty cache (read-your-writes).
-- `FLUSH` persists dirty blocks with chunked `WriteBatch` calls (`<= 512` writes per call).
+- `FLUSH` persists dirty blocks with chunked `WriteBatch` calls (`<= 512` writes per engine batch, sub-chunked to `<= 64` writes per RPC).
 - High-water pressure triggers synchronous flush; if retry budget/deadline is exhausted, writes/flush fail with I/O error.
 - Dirty data is never silently dropped; failed flush keeps dirty entries for retry.
 - Transient RPC failures use bounded retry with exponential backoff and reconnect.

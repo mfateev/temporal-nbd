@@ -60,7 +60,6 @@ mod linux {
     use super::*;
     use std::fs::OpenOptions;
     use std::io::{self, Read, Write};
-    use std::mem::size_of;
     use std::os::fd::{AsRawFd, RawFd};
     use std::os::unix::net::UnixStream;
     use std::thread;
@@ -389,10 +388,17 @@ mod linux {
         errno: i32,
         payload: &[u8],
     ) -> io::Result<()> {
+        debug_assert!(
+            errno >= 0,
+            "NBD reply errno should be non-negative, got {}",
+            errno
+        );
+        let sanitized_errno = if errno < 0 { libc::EIO } else { errno };
+
         let mut header = [0_u8; 16];
         header[0..4].copy_from_slice(&NBD_REPLY_MAGIC.to_be_bytes());
         header[4..8]
-            .copy_from_slice(&(u32::try_from(errno.max(0)).unwrap_or(u32::MAX)).to_be_bytes());
+            .copy_from_slice(&(u32::try_from(sanitized_errno).unwrap_or(u32::MAX)).to_be_bytes());
         header[8..16].copy_from_slice(&handle);
 
         stream.write_all(&header)?;
@@ -448,7 +454,4 @@ mod linux {
     fn close_fd(fd: RawFd) {
         let _ = unsafe { libc::close(fd) };
     }
-
-    #[allow(dead_code)]
-    const _: usize = size_of::<libc::c_ulong>();
 }

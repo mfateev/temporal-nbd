@@ -23,6 +23,8 @@ Options:
   --temporal-bin PATH         Temporal server binary path (default: /tmp/temporal-server-remote-e2e)
   --temporal-env NAME         Temporal config env (default: development-sqlite)
   --temporal-start-timeout N  Startup timeout in seconds (default: 30)
+  --local-log-dir PATH        Local directory for downloaded remote logs
+                              (default: target/remote-test-logs/<run-id>)
   --copy-only                 Build and copy artifacts, skip remote execution
   -h, --help                  Show this help
 
@@ -60,6 +62,12 @@ json_out=""
 manifest_raw=""
 stage_dir=""
 real_nbd_cli_bin=""
+RUN_ID="$(date -u +%Y%m%dT%H%M%SZ)-$$"
+REMOTE_LOG_SUBDIR="logs-${RUN_ID}"
+REMOTE_LOG_DIR="${REMOTE_DIR}/${REMOTE_LOG_SUBDIR}"
+LOCAL_LOG_DIR_OVERRIDE=""
+LOCAL_LOG_DIR=""
+REMOTE_EXEC_STATUS=0
 
 declare -a CARGO_ARGS=()
 declare -a REMOTE_ENVS=()
@@ -119,6 +127,10 @@ while [[ $# -gt 0 ]]; do
       TEMPORAL_START_TIMEOUT_SECS="$2"
       shift 2
       ;;
+    --local-log-dir)
+      LOCAL_LOG_DIR_OVERRIDE="$2"
+      shift 2
+      ;;
     --copy-only)
       COPY_ONLY=1
       shift
@@ -155,6 +167,12 @@ require_cmd tar
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$repo_root"
+
+if [[ -n "$LOCAL_LOG_DIR_OVERRIDE" ]]; then
+  LOCAL_LOG_DIR="$LOCAL_LOG_DIR_OVERRIDE"
+else
+  LOCAL_LOG_DIR="$repo_root/target/remote-test-logs/$RUN_ID"
+fi
 
 has_remote_env_key() {
   local key="$1"
@@ -529,24 +547,304 @@ if ! has_remote_env_key "TEMPORAL_NBD_BIN"; then
   remote_exports+="export TEMPORAL_NBD_BIN=./temporal-nbd-cli\n"
 fi
 
-echo "running test executables on remote"
+if ! has_remote_env_key "RUST_BACKTRACE"; then
+  remote_exports+="export RUST_BACKTRACE=full\n"
+fi
+if ! has_remote_env_key "RUST_LOG"; then
+  remote_exports+="export RUST_LOG=trace\n"
+fi
+if ! has_remote_env_key "RUST_TEST_THREADS"; then
+  remote_exports+="export RUST_TEST_THREADS=1\n"
+fi
+
+fetch_remote_logs() {
+  if (( COPY_ONLY == 1 )); then
+    return 0
+  fi
+
+  mkdir -p "$LOCAL_LOG_DIR"
+  if ssh -o ConnectTimeout=8 "$REMOTE" "test -d $(printf '%q' "$REMOTE_LOG_DIR")"; then
+    if ssh "$REMOTE" "tar -C $(printf '%q' "$REMOTE_DIR") -cf - $(printf '%q' "$REMOTE_LOG_SUBDIR")" \
+      | tar -C "$LOCAL_LOG_DIR" -xf -; then
+      echo "downloaded remote troubleshooting logs to $LOCAL_LOG_DIR/$REMOTE_LOG_SUBDIR"
+    else
+      echo "warning: failed to download remote logs from $REMOTE_LOG_DIR" >&2
+    fi
+  else
+    echo "warning: remote log directory not found: $REMOTE_LOG_DIR" >&2
+  fi
+}
+
+echo "running test executables on remote (log dir: $REMOTE_LOG_DIR)"
+set +e
 ssh "$REMOTE" "bash -s" <<__REMOTE__
 set -euo pipefail
 cd $(printf '%q' "$REMOTE_DIR")
 $(printf '%b' "$remote_exports")
 TAB=\$(printf '\t')
+LOG_DIR="./$(printf '%q' "$REMOTE_LOG_SUBDIR")"
+mkdir -p "\$LOG_DIR"
+ATTACH_LOG_MARKER="\$LOG_DIR/.attach-log-start"
+: > "\$ATTACH_LOG_MARKER"
+
+if sudo -n true >/dev/null 2>&1; then
+  SUDO_BIN=(sudo -n)
+else
+  SUDO_BIN=()
+fi
+SUDO_PRESERVE_ENV=""
+if ((\${#SUDO_BIN[@]} > 0)); then
+  preserve_vars=()
+  while IFS='=' read -r env_name _; do
+    case "\$env_name" in
+      TEMPORAL_*|RUST_*)
+        preserve_vars+=("\$env_name")
+        ;;
+    esac
+  done < <(env)
+  if ((\${#preserve_vars[@]} > 0)); then
+    old_ifs="\$IFS"
+    IFS=,
+    SUDO_PRESERVE_ENV="\${preserve_vars[*]}"
+    IFS="\$old_ifs"
+  fi
+fi
+TRACE_CMD_ENABLED=0
+TRACE_CMD_REASON="trace-cmd unavailable"
+if command -v trace-cmd >/dev/null 2>&1 && ((\${#SUDO_BIN[@]} > 0)); then
+  if "\${SUDO_BIN[@]}" test -e /sys/kernel/debug/tracing/tracing_on >/dev/null 2>&1; then
+    TRACE_CMD_ENABLED=1
+    TRACE_CMD_REASON="enabled (existing debugfs tracing)"
+  else
+    "\${SUDO_BIN[@]}" mount -t debugfs debugfs /sys/kernel/debug >/dev/null 2>&1 || true
+    if "\${SUDO_BIN[@]}" test -e /sys/kernel/debug/tracing/tracing_on >/dev/null 2>&1; then
+      TRACE_CMD_ENABLED=1
+      TRACE_CMD_REASON="enabled (mounted debugfs)"
+    else
+      TRACE_CMD_REASON="debugfs tracing unavailable"
+    fi
+  fi
+elif command -v trace-cmd >/dev/null 2>&1; then
+  TRACE_CMD_REASON="sudo -n unavailable for trace-cmd"
+fi
+
+collect_host_snapshot() {
+  local out_prefix="\$1"
+  {
+    echo "timestamp_utc=\$(date -u +%FT%TZ)"
+    uname -a || true
+    id || true
+    echo
+    echo "tooling:"
+    for t in strace trace-cmd blktrace bpftrace perf dmesg mkfs.ext4 dd mount umount blockdev; do
+      if command -v "\$t" >/dev/null 2>&1; then
+        echo "  \$t=\$(command -v "\$t")"
+      elif [[ -x "/sbin/\$t" ]]; then
+        echo "  \$t=/sbin/\$t"
+      elif [[ -x "/usr/sbin/\$t" ]]; then
+        echo "  \$t=/usr/sbin/\$t"
+      else
+        echo "  \$t=not-found"
+      fi
+    done
+    echo "trace_cmd_state=\$TRACE_CMD_REASON"
+    echo
+    echo "block-devices:"
+    if command -v lsblk >/dev/null 2>&1; then
+      lsblk -a -o NAME,MAJ:MIN,SIZE,RO,TYPE,MOUNTPOINTS || true
+    else
+      ls -l /dev/nbd* 2>&1 || true
+    fi
+    echo
+    echo "mounts:"
+    if command -v findmnt >/dev/null 2>&1; then
+      findmnt -A || true
+    else
+      mount || true
+    fi
+    echo
+    echo "disk-usage:"
+    df -h || true
+  } > "\${out_prefix}.log" 2>&1
+}
+
+collect_nbd_snapshot() {
+  local out_file="\$1"
+  {
+    echo "timestamp_utc=\$(date -u +%FT%TZ)"
+    ls -l /dev/nbd* 2>&1 || true
+    for dev in /sys/block/nbd*; do
+      [[ -e "\$dev" ]] || continue
+      echo "== \${dev} =="
+      for rel in size ro pid stat queue/logical_block_size queue/physical_block_size queue/max_hw_sectors_kb queue/max_sectors_kb queue/read_ahead_kb; do
+        if [[ -f "\$dev/\$rel" ]]; then
+          printf '%s: %s\n' "\$rel" "\$(cat "\$dev/\$rel" 2>/dev/null || true)"
+        fi
+      done
+    done
+  } > "\$out_file" 2>&1
+}
+
+copy_attach_logs() {
+  if [[ -f "\$ATTACH_LOG_MARKER" ]]; then
+    find /tmp -maxdepth 1 -type f -name 'temporal-nbd-attach-*.log' -newer "\$ATTACH_LOG_MARKER" \
+      -exec cp -f {} "\$LOG_DIR/" \; 2>/dev/null || true
+    return 0
+  fi
+  find /tmp -maxdepth 1 -type f -name 'temporal-nbd-attach-*.log' -exec cp -f {} "\$LOG_DIR/" \; 2>/dev/null || true
+  return 0
+}
+
+start_dmesg_stream() {
+  local out_file="\$1"
+  if ! command -v dmesg >/dev/null 2>&1; then
+    return 0
+  fi
+  if ((\${#SUDO_BIN[@]} > 0)); then
+    "\${SUDO_BIN[@]}" dmesg -wT >"\$out_file" 2>&1 &
+  else
+    dmesg -wT >"\$out_file" 2>&1 &
+  fi
+  echo "\$!"
+}
+
+stop_dmesg_stream() {
+  local pid="\$1"
+  if [[ -z "\$pid" ]]; then
+    return 0
+  fi
+  if kill -0 "\$pid" >/dev/null 2>&1; then
+    kill "\$pid" >/dev/null 2>&1 || true
+    wait "\$pid" >/dev/null 2>&1 || true
+  fi
+}
+
+dump_dmesg_snapshot() {
+  local out_file="\$1"
+  if ! command -v dmesg >/dev/null 2>&1; then
+    return 0
+  fi
+  if ((\${#SUDO_BIN[@]} > 0)); then
+    "\${SUDO_BIN[@]}" dmesg -T >"\$out_file" 2>&1 || true
+  else
+    dmesg -T >"\$out_file" 2>&1 || true
+  fi
+}
+
+run_with_diagnostics() {
+  local mode="\$1"
+  local target_name="\$2"
+  local target_kind="\$3"
+  local exec_base="\$4"
+  shift 4
+
+  local safe_target
+  safe_target="\$(printf '%s' "\$target_name" | tr -c 'A-Za-z0-9._-' '_')"
+  local prefix="\$LOG_DIR/\${mode}-\${safe_target}"
+  local dmesg_pid=""
+
+  echo "==> [\${mode}] \${target_name} (\${target_kind})"
+  echo "    diagnostics: \${prefix}.*"
+  collect_nbd_snapshot "\${prefix}.nbd.before.log"
+  dump_dmesg_snapshot "\${prefix}.dmesg.before.log"
+  dmesg_pid="\$(start_dmesg_stream "\${prefix}.dmesg.stream.log" || true)"
+
+  local -a cmd=("./\$exec_base" "\$@")
+  if command -v strace >/dev/null 2>&1; then
+    if ((\${#SUDO_BIN[@]} > 0)); then
+      if [[ -n "\$SUDO_PRESERVE_ENV" ]]; then
+        cmd=(
+          "\${SUDO_BIN[@]}"
+          "--preserve-env=\${SUDO_PRESERVE_ENV}"
+          strace -ff -ttt -T -yy -xx -s 256 -o "\${prefix}.strace"
+          "\${cmd[@]}"
+        )
+      else
+        cmd=("\${SUDO_BIN[@]}" strace -ff -ttt -T -yy -xx -s 256 -o "\${prefix}.strace" "\${cmd[@]}")
+      fi
+    else
+      cmd=(strace -ff -ttt -T -yy -xx -s 256 -o "\${prefix}.strace" "\${cmd[@]}")
+    fi
+  fi
+  if (( TRACE_CMD_ENABLED == 1 )); then
+    if [[ "\${cmd[0]:-}" == "sudo" ]]; then
+      drop=1
+      if [[ "\${cmd[\$drop]:-}" == "-n" ]]; then
+        ((drop++))
+      fi
+      if [[ "\${cmd[\$drop]:-}" == --preserve-env=* ]]; then
+        ((drop++))
+      fi
+      cmd=("\${cmd[@]:\$drop}")
+    fi
+    cmd=("\${SUDO_BIN[@]}" trace-cmd record -q -o "\${prefix}.trace-cmd.dat" -e block:* -e ext4:* -- "\${cmd[@]}")
+  fi
+
+  {
+    echo "timestamp_utc=\$(date -u +%FT%TZ)"
+    echo "mode=\$mode"
+    echo "target_name=\$target_name"
+    echo "target_kind=\$target_kind"
+    echo "trace_cmd_state=\$TRACE_CMD_REASON"
+    printf 'command='
+    printf '%q ' "\${cmd[@]}"
+    printf '\n'
+  } > "\${prefix}.meta.log"
+
+  set +e
+  "\${cmd[@]}" >"\${prefix}.stdout.log" 2>"\${prefix}.stderr.log"
+  local rc=\$?
+  set -e
+
+  if [[ -s "\${prefix}.stdout.log" ]]; then
+    cat "\${prefix}.stdout.log"
+  fi
+  if [[ -s "\${prefix}.stderr.log" ]]; then
+    cat "\${prefix}.stderr.log" >&2
+  fi
+
+  stop_dmesg_stream "\$dmesg_pid"
+  dump_dmesg_snapshot "\${prefix}.dmesg.after.log"
+  collect_nbd_snapshot "\${prefix}.nbd.after.log"
+  copy_attach_logs
+
+  if (( rc != 0 )); then
+    echo "command failed: mode=\$mode target=\$target_name exit=\$rc" >&2
+    echo "troubleshooting logs are in \$LOG_DIR" >&2
+    return \$rc
+  fi
+
+  return 0
+}
+
+remote_cleanup() {
+  collect_host_snapshot "\$LOG_DIR/host-end"
+  copy_attach_logs
+}
+trap remote_cleanup EXIT
+
+collect_host_snapshot "\$LOG_DIR/host-start"
 
 while IFS="\$TAB" read -r target_name target_kind exec_base; do
-  echo "==> [normal] \$target_name (\$target_kind)"
-  "./\$exec_base" --nocapture
+  run_with_diagnostics normal "\$target_name" "\$target_kind" "\$exec_base" --nocapture
 done < manifest.tsv
 
 if [[ "$RUN_IGNORED" == "1" ]]; then
   while IFS="\$TAB" read -r target_name target_kind exec_base; do
-    echo "==> [ignored] \$target_name (\$target_kind)"
-    "./\$exec_base" --ignored --nocapture
+    run_with_diagnostics ignored "\$target_name" "\$target_kind" "\$exec_base" --ignored --nocapture
   done < manifest.tsv
 fi
 __REMOTE__
+REMOTE_EXEC_STATUS=$?
+set -e
+
+fetch_remote_logs || true
+
+if (( REMOTE_EXEC_STATUS != 0 )); then
+  echo "remote prebuilt test run failed (exit=${REMOTE_EXEC_STATUS})" >&2
+  echo "use logs from: $LOCAL_LOG_DIR/$REMOTE_LOG_SUBDIR" >&2
+  exit "$REMOTE_EXEC_STATUS"
+fi
 
 echo "remote prebuilt test run complete"
+echo "troubleshooting logs available at: $LOCAL_LOG_DIR/$REMOTE_LOG_SUBDIR"

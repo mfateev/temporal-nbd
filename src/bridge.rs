@@ -98,10 +98,22 @@ async fn handle_request<E: BlockDeviceEngine>(
                 Ok((start_lba, block_count)) => {
                     match engine.read_blocks(start_lba, block_count).await {
                         Ok(data) => (BridgeResponse::ok(data), false),
-                        Err(err) => (BridgeResponse::from_error(err), false),
+                        Err(err) => {
+                            eprintln!(
+                                "bridge read failed: offset_bytes={} length_bytes={} start_lba={} block_count={} err={}",
+                                offset_bytes, length_bytes, start_lba, block_count, err
+                            );
+                            (BridgeResponse::from_error(err), false)
+                        }
                     }
                 }
-                Err(err) => (BridgeResponse::from_error(err), false),
+                Err(err) => {
+                    eprintln!(
+                        "bridge read request rejected: offset_bytes={} length_bytes={} err={}",
+                        offset_bytes, length_bytes, err
+                    );
+                    (BridgeResponse::from_error(err), false)
+                }
             }
         }
         BridgeCommand::Write { offset_bytes, data } => {
@@ -111,21 +123,45 @@ async fn handle_request<E: BlockDeviceEngine>(
                 block_size_bytes,
             );
             match translated {
-                Ok((start_lba, _)) => match engine.write_blocks(start_lba, &data).await {
+                Ok((start_lba, block_count)) => match engine.write_blocks(start_lba, &data).await {
                     Ok(()) => (BridgeResponse::ok(Vec::new()), false),
-                    Err(err) => (BridgeResponse::from_error(err), false),
+                    Err(err) => {
+                        eprintln!(
+                            "bridge write failed: offset_bytes={} data_len={} start_lba={} block_count={} err={}",
+                            offset_bytes,
+                            data.len(),
+                            start_lba,
+                            block_count,
+                            err
+                        );
+                        (BridgeResponse::from_error(err), false)
+                    }
                 },
-                Err(err) => (BridgeResponse::from_error(err), false),
+                Err(err) => {
+                    eprintln!(
+                        "bridge write request rejected: offset_bytes={} data_len={} err={}",
+                        offset_bytes,
+                        data.len(),
+                        err
+                    );
+                    (BridgeResponse::from_error(err), false)
+                }
             }
         }
         BridgeCommand::Flush => match engine.flush().await {
             Ok(()) => (BridgeResponse::ok(Vec::new()), false),
-            Err(err) => (BridgeResponse::from_error(err), false),
+            Err(err) => {
+                eprintln!("bridge flush failed: err={}", err);
+                (BridgeResponse::from_error(err), false)
+            }
         },
         BridgeCommand::Disconnect => {
             let response = match engine.disconnect().await {
                 Ok(()) => BridgeResponse::ok(Vec::new()),
-                Err(err) => BridgeResponse::from_error(err),
+                Err(err) => {
+                    eprintln!("bridge disconnect failed: err={}", err);
+                    BridgeResponse::from_error(err)
+                }
             };
             (response, true)
         }
