@@ -2,6 +2,7 @@ use tonic::transport::Channel;
 
 pub mod attach;
 pub mod bridge;
+pub mod create;
 pub mod engine;
 pub mod errors;
 pub mod nbd;
