@@ -8,6 +8,13 @@ use tonic::transport::{Channel, Endpoint};
 use tonic::Code;
 use uuid::Uuid;
 
+pub mod attach;
+pub mod bridge;
+pub mod engine;
+pub mod errors;
+pub mod nbd;
+pub mod session;
+
 pub mod temporal {
     pub mod api {
         pub mod activity {

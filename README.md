@@ -1,28 +1,28 @@
 # temporal-nbd
 
-Phase 2 Rust smoke client for Temporal CHASM blockdevice over `workflowservice`.
+Rust client for Temporal CHASM blockdevice over `workflowservice`.
 
-## What this does
+## Modes
 
-- Calls `CreateVolume` against Temporal frontend `workflowservice`.
-- Calls `CreateVolume` a second time with the same `volume_id` and asserts `AlreadyExists`.
-- Calls `OpenVolume`, `WriteBatch`, and `ReadBlocks`.
-- Verifies unwritten block zero-fill and `InvalidArgument` for out-of-range reads/writes.
-- Stores `volume_id` to disk for reconnect flows.
+- `smoke` (default): Create/Open/Write/Read contract validation against frontend `workflowservice`.
+- `attach`: Attach one Temporal volume to one Linux NBD device and serve `READ`, `WRITE`, `FLUSH`, `DISC`.
 
 ## Prereqs
 
-- Temporal server running with blockdevice module wired through frontend/workflowservice.
-- A namespace created in Temporal.
-- Namespace **name**.
+- Temporal server running with blockdevice module exposed via frontend/workflowservice.
+- Temporal namespace (name, not namespace ID).
+- Linux host for `attach` mode.
+- NBD kernel module loaded (`sudo modprobe nbd max_part=0`).
+- NBD device node available (for example `/dev/nbd0`).
+- Permission to open/configure `/dev/nbdX` (typically root).
 
-## Environment
+## Smoke Mode
 
-Required:
+Required env:
 
 - `TEMPORAL_NAMESPACE`
 
-Optional:
+Optional env:
 
 - `TEMPORAL_FRONTEND_ENDPOINT` (default: `127.0.0.1:7233`)
 - `TEMPORAL_VOLUME_ID` (default: generated)
@@ -31,42 +31,68 @@ Optional:
 - `TEMPORAL_VOLUME_ID_FILE` (default: `./phase2-volume-id.txt`)
 - `TEMPORAL_CONNECT_TIMEOUT_SECS` (default: `5`)
 - `TEMPORAL_RPC_TIMEOUT_SECS` (default: `5`)
-- `TEMPORAL_API_REPO` path to Temporal API repo for workflowservice protos (default: `../api`)
-
-## Run as CLI smoke test
-
-```bash
-cargo run
-```
-
-## Run as test
-
-```bash
-cargo test -- --nocapture
-```
-
-The integration test is skipped unless `TEMPORAL_NAMESPACE` is set.
-
-## Full E2E (SQLite, source-built Temporal server)
-
-`tests/e2e_sqlite.rs` is a Rust-native integration test that:
-1. builds `temporal-server` from local source,
-2. starts it with `--env development-sqlite`,
-3. registers + describes a namespace via frontend gRPC,
-4. calls blockdevice operations via frontend/workflowservice and validates phase2 semantics.
-
-The test is marked `#[ignore]` because it is heavyweight and builds/runs a full server.
+- `TEMPORAL_API_REPO` path to Temporal API repo (default: `../api`)
 
 Run:
 
 ```bash
+cargo run
+# or
+cargo run -- smoke
+```
+
+## Attach Mode
+
+Attach required options:
+
+- namespace (`--namespace` or `TEMPORAL_NAMESPACE`)
+- volume id (`--volume-id` or `TEMPORAL_VOLUME_ID`)
+
+Typical run:
+
+```bash
+sudo cargo run -- attach \
+  --namespace default \
+  --volume-id my-volume \
+  --nbd-device /dev/nbd0
+```
+
+Attach flags (all also support env vars):
+
+- `--frontend-endpoint` / `TEMPORAL_FRONTEND_ENDPOINT` (default `127.0.0.1:7233`)
+- `--nbd-device` / `TEMPORAL_NBD_DEVICE` (default `/dev/nbd0`)
+- `--connect-timeout-secs` / `TEMPORAL_CONNECT_TIMEOUT_SECS` (default `5`)
+- `--rpc-timeout-secs` / `TEMPORAL_RPC_TIMEOUT_SECS` (default `5`)
+- `--retry-max-attempts` / `TEMPORAL_RETRY_MAX_ATTEMPTS` (default `8`)
+- `--retry-initial-backoff-ms` / `TEMPORAL_RETRY_INITIAL_BACKOFF_MS` (default `150`)
+- `--retry-max-backoff-ms` / `TEMPORAL_RETRY_MAX_BACKOFF_MS` (default `2000`)
+- `--dirty-high-water-blocks` / `TEMPORAL_DIRTY_HIGH_WATER_BLOCKS` (default `4096`)
+- `--flush-retry-deadline-secs` / `TEMPORAL_FLUSH_RETRY_DEADLINE_SECS` (default `20`)
+- `--flush-retry-interval-ms` / `TEMPORAL_FLUSH_RETRY_INTERVAL_MS` (default `200`)
+- `--engine-queue-capacity` / `TEMPORAL_ENGINE_QUEUE_CAPACITY` (default `1024`)
+- `--nbd-timeout-secs` / `TEMPORAL_NBD_TIMEOUT_SECS` (default `30`)
+
+## Runtime Semantics (Attach)
+
+- Dirty cache is keyed by LBA and coalesces overwrite writes (last write wins).
+- Reads fetch backend blocks and overlay dirty cache (read-your-writes).
+- `FLUSH` persists dirty blocks with chunked `WriteBatch` calls (`<= 512` writes per call).
+- High-water pressure triggers synchronous flush; if retry budget/deadline is exhausted, writes/flush fail with I/O error.
+- Dirty data is never silently dropped; failed flush keeps dirty entries for retry.
+- Transient RPC failures use bounded retry with exponential backoff and reconnect.
+- `SIGINT`/`SIGTERM` triggers graceful detach flow with best-effort final flush.
+
+## Validation
+
+```bash
+cargo test
+cargo test --test create_volume_smoke -- --nocapture
 cargo test --test e2e_sqlite -- --ignored --nocapture
 ```
 
-Optional E2E env:
-- `TEMPORAL_REPO` (default: `../temporal`)
-- `TEMPORAL_API_REPO` (default: `../api`)
-- `TEMPORAL_API_GO_REF` (default: `master`, used for `go.temporal.io/api@<ref>` during server build)
-- `GO_BIN` (default: `/usr/local/go/bin/go` if present, else `go`)
-- `TEMPORAL_FRONTEND_ENDPOINT` (default: `127.0.0.1:7233`)
-- `TEMPORAL_SERVER_ENV` (default: `development-sqlite`)
+## Troubleshooting
+
+- Missing `/dev/nbdX`: create/load NBD support (`modprobe nbd`) and verify device node exists.
+- Missing `/sys/module/nbd`: module not loaded; run `sudo modprobe nbd max_part=0`.
+- Permission denied on `/dev/nbdX`: rerun with sufficient privileges (typically root).
+- Device busy: ensure no existing consumer is attached; disconnect old session before attach.
