@@ -1,5 +1,7 @@
 use anyhow::Context;
 
+mod support;
+
 #[tokio::test]
 async fn create_volume_duplicate_returns_already_exists() -> anyhow::Result<()> {
     if std::env::var("TEMPORAL_NAMESPACE").is_err() {
@@ -9,10 +11,10 @@ async fn create_volume_duplicate_returns_already_exists() -> anyhow::Result<()> 
         return Ok(());
     }
 
-    let config =
-        temporal_nbd::SmokeConfig::from_env().context("failed to load config from environment")?;
+    let config = support::workflow_smoke::SmokeConfig::from_env()
+        .context("failed to load config from environment")?;
 
-    temporal_nbd::run_phase2_workflowservice_smoke(&config)
+    support::workflow_smoke::run_phase2_workflowservice_smoke(&config)
         .await
         .context("smoke test failed")
 }

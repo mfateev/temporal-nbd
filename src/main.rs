@@ -8,19 +8,14 @@ use std::time::Duration;
 #[command(about = "Temporal blockdevice client")]
 struct Cli {
     #[command(subcommand)]
-    command: Option<Command>,
+    command: Command,
 }
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Run workflowservice smoke flow
-    Smoke(SmokeArgs),
     /// Attach one Temporal volume to one Linux NBD device
     Attach(AttachArgs),
 }
-
-#[derive(Debug, Args, Default)]
-struct SmokeArgs {}
 
 #[derive(Debug, Args)]
 struct AttachArgs {
@@ -100,22 +95,7 @@ impl From<AttachArgs> for temporal_nbd::attach::AttachConfig {
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
-    match cli.command.unwrap_or(Command::Smoke(SmokeArgs::default())) {
-        Command::Smoke(_) => {
-            let config = temporal_nbd::SmokeConfig::from_env()
-                .context("failed to load smoke-test configuration from environment")?;
-
-            temporal_nbd::run_phase2_workflowservice_smoke(&config)
-                .await
-                .context("phase2 smoke test failed")?;
-
-            println!(
-                "Phase 2 smoke test passed. Stored volume_id={} in {}",
-                config.volume_id,
-                config.volume_id_file.display()
-            );
-            Ok(())
-        }
+    match cli.command {
         Command::Attach(args) => {
             temporal_nbd::attach::run_attach(args.into())
                 .await

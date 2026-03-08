@@ -6,22 +6,22 @@ See also:
 - `DESIGN.md` for architecture.
 - `CONTRIBUTING.md` for branch pairing, build, and remote test workflows.
 
-## Modes
+## Runtime
 
-- `smoke` (default): Create/Open/Write/Read contract validation against frontend `workflowservice`.
 - `attach`: Attach one Temporal volume to one Linux NBD device and serve `READ`, `WRITE`, `FLUSH`, `DISC`.
+- `create_volume_smoke` test: workflowservice Create/Open/Write/Read contract validation lives in `tests/create_volume_smoke.rs`.
 
 ## Prereqs
 
 - Temporal server running with blockdevice module exposed via frontend/workflowservice.
 - Temporal namespace (name, not namespace ID).
-- Linux host for `attach` mode.
+- Linux host for attach runtime.
 - NBD kernel module loaded (`sudo modprobe nbd max_part=0`).
 - NBD device node available (for example `/dev/nbd0`).
 - Permission to open/configure `/dev/nbdX` (typically root).
 - Build-time proto source: set `TEMPORAL_API_REPO` only when compiling if your API checkout is not at `../api`.
 
-## Smoke Mode
+## Smoke E2E Test
 
 Required env:
 
@@ -40,9 +40,7 @@ Optional env:
 Run:
 
 ```bash
-cargo run
-# or
-cargo run -- smoke
+cargo test --test create_volume_smoke -- --nocapture
 ```
 
 ## Attach Mode
@@ -73,9 +71,6 @@ export TEMPORAL_FRONTEND_ENDPOINT=127.0.0.1:7233
 export TEMPORAL_NAMESPACE=default
 export TEMPORAL_VOLUME_ID=my-volume
 
-# Smoke
-"$TEMPORAL_NBD_BIN" smoke
-
 # Attach
 sudo "$TEMPORAL_NBD_BIN" attach \
   --frontend-endpoint "$TEMPORAL_FRONTEND_ENDPOINT" \
@@ -101,10 +96,10 @@ export TEMPORAL_NAMESPACE=default
 export TEMPORAL_VOLUME_ID=my-volume
 ```
 
-2. Create/open the volume once (smoke mode does this and validates API behavior).
+2. Create/open the volume once by running the smoke e2e test.
 
 ```bash
-cargo run -- smoke
+cargo test --test create_volume_smoke -- --nocapture
 ```
 
 3. Start attach mode in terminal A.

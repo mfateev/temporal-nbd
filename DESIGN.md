@@ -29,7 +29,7 @@ The system has four runtime layers:
 - Enforces alignment and bounds.
 - Implements read overlay and flush semantics.
 
-4. Temporal session/RPC layer (`src/session.rs`, `src/lib.rs`)
+4. Temporal session/RPC layer (`src/session.rs`)
 - Opens volume metadata (`OpenVolume`).
 - Calls `ReadBlocks` and `WriteBatch`.
 - Applies retry/backoff and reconnect logic for retryable failures.
@@ -91,10 +91,11 @@ The system has four runtime layers:
 
 ## Key Files
 
-- `src/main.rs`: CLI entrypoint (`smoke`, `attach`).
+- `src/main.rs`: CLI entrypoint (`attach` only).
 - `src/attach.rs`: attach orchestration and shutdown handling.
 - `src/nbd.rs`: Linux NBD ioctl and request/reply loop.
 - `src/bridge.rs`: protocol-to-block translation.
 - `src/engine.rs`: cache, flush, chunking, and core block engine semantics.
 - `src/session.rs`: Temporal RPC session with retries and transport recovery.
+- `tests/support/workflow_smoke.rs`: test-only workflowservice smoke helpers.
 - `tests/e2e_nbd_mount.rs`: kernel-gated durability test (detach/reattach roundtrip).

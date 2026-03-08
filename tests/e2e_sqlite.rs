@@ -10,11 +10,12 @@ use temporal_nbd::workflowservicepb::{
     workflow_service_client::WorkflowServiceClient, DescribeNamespaceRequest,
     RegisterNamespaceRequest,
 };
-use temporal_nbd::{run_phase2_workflowservice_smoke, SmokeConfig};
 use tokio::time::{sleep, timeout};
 use tonic::transport::Endpoint;
 use tonic::Code;
 use uuid::Uuid;
+
+mod support;
 
 #[tokio::test]
 #[ignore = "builds and runs source temporal-server with development-sqlite"]
@@ -56,7 +57,7 @@ async fn run_phase2_e2e() -> anyhow::Result<()> {
     let volume_id = format!("phase1-e2e-sqlite-{run_suffix}");
     let volume_id_file = env::temp_dir().join(format!("phase1-e2e-volume-id-{run_suffix}.txt"));
 
-    let config = SmokeConfig {
+    let config = support::workflow_smoke::SmokeConfig {
         frontend_endpoint,
         namespace: namespace_name.clone(),
         volume_id: volume_id.clone(),
@@ -67,7 +68,7 @@ async fn run_phase2_e2e() -> anyhow::Result<()> {
         rpc_timeout: Duration::from_secs(5),
     };
 
-    run_phase2_workflowservice_smoke(&config)
+    support::workflow_smoke::run_phase2_workflowservice_smoke(&config)
         .await
         .context("phase2 workflowservice smoke flow failed")?;
 
