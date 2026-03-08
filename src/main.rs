@@ -8,19 +8,51 @@ use std::time::Duration;
 #[command(about = "Temporal blockdevice client")]
 struct Cli {
     #[command(subcommand)]
-    command: Option<Command>,
+    command: Command,
 }
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Run workflowservice smoke flow
-    Smoke(SmokeArgs),
+    /// Create one Temporal volume
+    CreateVolume(CreateVolumeArgs),
+
     /// Attach one Temporal volume to one Linux NBD device
     Attach(AttachArgs),
 }
 
-#[derive(Debug, Args, Default)]
-struct SmokeArgs {}
+#[derive(Debug, Args)]
+struct CreateVolumeArgs {
+    #[arg(
+        long,
+        env = "TEMPORAL_FRONTEND_ENDPOINT",
+        default_value = "127.0.0.1:7233"
+    )]
+    frontend_endpoint: String,
+
+    #[arg(long, env = "TEMPORAL_NAMESPACE")]
+    namespace: String,
+
+    #[arg(long, env = "TEMPORAL_VOLUME_ID")]
+    volume_id: String,
+
+    #[arg(long, env = "TEMPORAL_VOLUME_SIZE_BYTES", default_value_t = 1 << 30)]
+    size_bytes: u64,
+
+    #[arg(long, env = "TEMPORAL_VOLUME_BLOCK_SIZE_BYTES", default_value_t = 0)]
+    block_size_bytes: u32,
+
+    #[arg(long, env = "TEMPORAL_CONNECT_TIMEOUT_SECS", default_value_t = 5)]
+    connect_timeout_secs: u64,
+
+    #[arg(long, env = "TEMPORAL_RPC_TIMEOUT_SECS", default_value_t = 5)]
+    rpc_timeout_secs: u64,
+
+    #[arg(long, env = "TEMPORAL_CREATE_REQUEST_ID")]
+    request_id: Option<String>,
+
+    #[arg(long, env = "TEMPORAL_CREATE_IF_NOT_EXISTS", default_value_t = false)]
+    if_not_exists: bool,
+}
 
 #[derive(Debug, Args)]
 struct AttachArgs {
@@ -96,24 +128,47 @@ impl From<AttachArgs> for temporal_nbd::attach::AttachConfig {
     }
 }
 
+impl From<CreateVolumeArgs> for temporal_nbd::create::CreateVolumeConfig {
+    fn from(value: CreateVolumeArgs) -> Self {
+        Self {
+            frontend_endpoint: value.frontend_endpoint,
+            namespace: value.namespace,
+            volume_id: value.volume_id,
+            size_bytes: value.size_bytes,
+            block_size_bytes: value.block_size_bytes,
+            connect_timeout: Duration::from_secs(value.connect_timeout_secs),
+            rpc_timeout: Duration::from_secs(value.rpc_timeout_secs),
+            request_id: value.request_id,
+            if_not_exists: value.if_not_exists,
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
-    match cli.command.unwrap_or(Command::Smoke(SmokeArgs::default())) {
-        Command::Smoke(_) => {
-            let config = temporal_nbd::SmokeConfig::from_env()
-                .context("failed to load smoke-test configuration from environment")?;
-
-            temporal_nbd::run_phase2_workflowservice_smoke(&config)
+    match cli.command {
+        Command::CreateVolume(args) => {
+            let namespace = args.namespace.clone();
+            let volume_id = args.volume_id.clone();
+            let outcome = temporal_nbd::create::run_create_volume(args.into())
                 .await
-                .context("phase2 smoke test failed")?;
-
-            println!(
-                "Phase 2 smoke test passed. Stored volume_id={} in {}",
-                config.volume_id,
-                config.volume_id_file.display()
-            );
+                .context("create-volume failed")?;
+            match outcome {
+                temporal_nbd::create::CreateVolumeOutcome::Created { run_id } => {
+                    println!(
+                        "created volume '{}' in namespace '{}' (run_id={run_id})",
+                        volume_id, namespace
+                    );
+                }
+                temporal_nbd::create::CreateVolumeOutcome::AlreadyExists => {
+                    println!(
+                        "volume '{}' already exists in namespace '{}'",
+                        volume_id, namespace
+                    );
+                }
+            }
             Ok(())
         }
         Command::Attach(args) => {

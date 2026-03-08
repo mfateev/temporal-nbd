@@ -7,22 +7,23 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
-use temporal_nbd::{connect_workflow_client, create_volume, SmokeConfig};
 use tonic::Code;
 use uuid::Uuid;
 
+mod support;
+
 #[tokio::test]
 #[ignore = "requires Linux NBD device + root privileges + running Temporal frontend"]
-async fn phase2_e2e_nbd_attach_mount_roundtrip() -> anyhow::Result<()> {
+async fn phase_c_e2e_nbd_attach_detach_reattach_roundtrip() -> anyhow::Result<()> {
     tokio::time::timeout(
         Duration::from_secs(420),
-        run_phase2_e2e_nbd_attach_mount_roundtrip(),
+        run_phase_c_e2e_nbd_attach_mount_roundtrip(),
     )
     .await
     .context("nbd mount e2e test timed out")?
 }
 
-async fn run_phase2_e2e_nbd_attach_mount_roundtrip() -> anyhow::Result<()> {
+async fn run_phase_c_e2e_nbd_attach_mount_roundtrip() -> anyhow::Result<()> {
     if !cfg!(target_os = "linux") {
         eprintln!("Skipping nbd mount test: Linux required");
         return Ok(());
@@ -33,7 +34,7 @@ async fn run_phase2_e2e_nbd_attach_mount_roundtrip() -> anyhow::Result<()> {
     let namespace = env::var("TEMPORAL_NAMESPACE")
         .context("TEMPORAL_NAMESPACE is required for nbd mount e2e test")?;
     let volume_id = env::var("TEMPORAL_VOLUME_ID")
-        .unwrap_or_else(|_| format!("phaseb-nbd-{}", Uuid::new_v4().simple()));
+        .unwrap_or_else(|_| format!("phasec-nbd-{}", Uuid::new_v4().simple()));
     let device_path =
         PathBuf::from(env::var("TEMPORAL_NBD_DEVICE").unwrap_or_else(|_| "/dev/nbd0".to_string()));
 
@@ -69,14 +70,14 @@ async fn run_phase2_e2e_nbd_attach_mount_roundtrip() -> anyhow::Result<()> {
         // Keep default geometry within current Temporal mutable-state limits for CHASM block storage.
         .unwrap_or(32 * 1024 * 1024);
 
-    let create_config = SmokeConfig {
+    let create_config = support::workflow_smoke::SmokeConfig {
         frontend_endpoint: frontend_endpoint.clone(),
         namespace: namespace.clone(),
         volume_id: volume_id.clone(),
         size_bytes: volume_size_bytes,
         block_size_bytes: 4096,
         volume_id_file: env::temp_dir()
-            .join(format!("phaseb-nbd-volume-{}.txt", Uuid::new_v4().simple())),
+            .join(format!("phasec-nbd-volume-{}.txt", Uuid::new_v4().simple())),
         connect_timeout: Duration::from_secs(3),
         rpc_timeout: Duration::from_secs(8),
     };
@@ -90,27 +91,44 @@ async fn run_phase2_e2e_nbd_attach_mount_roundtrip() -> anyhow::Result<()> {
     fs::create_dir_all(&mount_dir)
         .with_context(|| format!("failed to create mount directory {}", mount_dir.display()))?;
 
-    let run_suffix = Uuid::new_v4().simple().to_string();
-    let attach_log = env::temp_dir().join(format!("temporal-nbd-attach-{run_suffix}.log"));
-    let mut attach_child = spawn_attach_process(
-        &privilege,
-        &attach_log,
-        &frontend_endpoint,
-        &namespace,
-        &volume_id,
-        &device_path,
-    )?;
+    let payload_path = mount_dir.join("roundtrip.bin");
+    let payload = deterministic_payload(256 * 1024);
+    let folder_path = mount_dir.join("folder-ops");
+    let nested_file_path = folder_path.join("nested.bin");
+    let nested_payload = deterministic_payload(64 * 1024);
+    let copied_file_path = folder_path.join("nested-copy.bin");
 
+    let run_suffix = Uuid::new_v4().simple().to_string();
+    let attach_log_session1 =
+        env::temp_dir().join(format!("temporal-nbd-attach-{run_suffix}-session1.log"));
+    let attach_log_session2 =
+        env::temp_dir().join(format!("temporal-nbd-attach-{run_suffix}-session2.log"));
+    let mut attach_child: Option<Child> = None;
+    let mut active_attach_log: Option<PathBuf> = None;
     let mut mounted = false;
+
     let result = (|| -> anyhow::Result<()> {
+        active_attach_log = Some(attach_log_session1.clone());
+        attach_child = Some(spawn_attach_process(
+            &privilege,
+            &attach_log_session1,
+            &frontend_endpoint,
+            &namespace,
+            &volume_id,
+            &device_path,
+        )?);
+
         wait_for_device_ready(
             &privilege,
             &device_path,
-            &mut attach_child,
-            &attach_log,
+            attach_child
+                .as_mut()
+                .context("attach child missing for session 1")?,
+            &attach_log_session1,
             Duration::from_secs(30),
         )?;
 
+        // This validates basic same-session raw block IO plumbing before filesystem formatting.
         verify_raw_block_roundtrip(&privilege, &device_path)?;
 
         let mkfs_result = run_privileged_command(
@@ -148,17 +166,12 @@ async fn run_phase2_e2e_nbd_attach_mount_roundtrip() -> anyhow::Result<()> {
             "chown mount root for test user",
         )?;
 
-        let payload_path = mount_dir.join("roundtrip.bin");
-        let payload = deterministic_payload(256 * 1024);
         fs::write(&payload_path, &payload)
             .with_context(|| format!("failed to write payload to {}", payload_path.display()))?;
 
-        let folder_path = mount_dir.join("folder-ops");
         fs::create_dir_all(&folder_path)
             .with_context(|| format!("failed to create folder {}", folder_path.display()))?;
 
-        let nested_file_path = folder_path.join("nested.bin");
-        let nested_payload = deterministic_payload(64 * 1024);
         fs::write(&nested_file_path, &nested_payload).with_context(|| {
             format!(
                 "failed to write nested payload to {}",
@@ -166,7 +179,6 @@ async fn run_phase2_e2e_nbd_attach_mount_roundtrip() -> anyhow::Result<()> {
             )
         })?;
 
-        let copied_file_path = folder_path.join("nested-copy.bin");
         let copied_bytes = fs::copy(&nested_file_path, &copied_file_path).with_context(|| {
             format!(
                 "failed to copy nested payload from {} to {}",
@@ -195,46 +207,42 @@ async fn run_phase2_e2e_nbd_attach_mount_roundtrip() -> anyhow::Result<()> {
         unmount_device(&privilege, &mount_dir)?;
         mounted = false;
 
-        mount_device(&privilege, &device_path, &mount_dir)?;
-        mounted = true;
+        stop_attach_process(
+            attach_child
+                .as_mut()
+                .context("attach child missing while stopping session 1")?,
+            &attach_log_session1,
+            Duration::from_secs(15),
+        )?;
+        attach_child = None;
+        active_attach_log = None;
+        wait_for_device_detached(&device_name, Duration::from_secs(10))?;
 
-        let roundtrip = fs::read(&payload_path)
-            .with_context(|| format!("failed to read payload from {}", payload_path.display()))?;
-        if roundtrip != payload {
-            bail!(
-                "payload mismatch after unmount/remount roundtrip ({} bytes)",
-                payload.len()
-            );
-        }
-
-        let nested_roundtrip = fs::read(&nested_file_path).with_context(|| {
+        run_session2_reattach_verify(
+            &privilege,
+            &frontend_endpoint,
+            &namespace,
+            &volume_id,
+            &device_path,
+            &device_name,
+            &mount_dir,
+            &payload_path,
+            &payload,
+            &nested_file_path,
+            &nested_payload,
+            &copied_file_path,
+            &attach_log_session2,
+            &mut attach_child,
+            &mut active_attach_log,
+            &mut mounted,
+        )
+        .with_context(|| {
             format!(
-                "failed to read nested payload from {}",
-                nested_file_path.display()
+                "session 2 failed\nsession 1 log tail:\n{}\nsession 2 log tail:\n{}",
+                log_tail(&attach_log_session1, 120),
+                log_tail(&attach_log_session2, 120)
             )
         })?;
-        if nested_roundtrip != nested_payload {
-            bail!(
-                "nested payload mismatch after unmount/remount roundtrip ({} bytes)",
-                nested_payload.len()
-            );
-        }
-
-        let copied_roundtrip = fs::read(&copied_file_path).with_context(|| {
-            format!(
-                "failed to read copied payload from {}",
-                copied_file_path.display()
-            )
-        })?;
-        if copied_roundtrip != nested_payload {
-            bail!(
-                "copied payload mismatch after unmount/remount roundtrip ({} bytes)",
-                nested_payload.len()
-            );
-        }
-
-        unmount_device(&privilege, &mount_dir)?;
-        mounted = false;
 
         Ok(())
     })();
@@ -243,14 +251,120 @@ async fn run_phase2_e2e_nbd_attach_mount_roundtrip() -> anyhow::Result<()> {
         let _ = unmount_device(&privilege, &mount_dir);
     }
 
-    let stop_result = stop_attach_process(&mut attach_child, &attach_log, Duration::from_secs(15));
+    let stop_result = if let Some(mut child) = attach_child.take() {
+        if let Some(log_path) = active_attach_log.as_ref() {
+            stop_attach_process_cleanup(&mut child, log_path, Duration::from_secs(15))
+        } else {
+            let _ = child.kill();
+            let _ = child.wait();
+            Ok(())
+        }
+    } else {
+        Ok(())
+    };
+    let detach_result = wait_for_device_detached(&device_name, Duration::from_secs(10));
     let _ = fs::remove_dir_all(&mount_dir);
+    let _ = fs::remove_file(&attach_log_session1);
+    let _ = fs::remove_file(&attach_log_session2);
 
-    match (result, stop_result) {
-        (Err(err), _) => Err(err),
-        (Ok(_), Err(err)) => Err(err),
-        (Ok(_), Ok(_)) => Ok(()),
+    match (result, stop_result, detach_result) {
+        (Err(err), _, _) => Err(err),
+        (Ok(_), Err(err), _) => Err(err),
+        (Ok(_), Ok(_), Err(err)) => Err(err),
+        (Ok(_), Ok(_), Ok(_)) => Ok(()),
     }
+}
+
+fn run_session2_reattach_verify(
+    privilege: &PrivilegeMode,
+    frontend_endpoint: &str,
+    namespace: &str,
+    volume_id: &str,
+    device_path: &Path,
+    device_name: &str,
+    mount_dir: &Path,
+    payload_path: &Path,
+    payload: &[u8],
+    nested_file_path: &Path,
+    nested_payload: &[u8],
+    copied_file_path: &Path,
+    attach_log_session2: &Path,
+    attach_child: &mut Option<Child>,
+    active_attach_log: &mut Option<PathBuf>,
+    mounted: &mut bool,
+) -> anyhow::Result<()> {
+    *active_attach_log = Some(attach_log_session2.to_path_buf());
+    *attach_child = Some(spawn_attach_process(
+        privilege,
+        attach_log_session2,
+        frontend_endpoint,
+        namespace,
+        volume_id,
+        device_path,
+    )?);
+
+    wait_for_device_ready(
+        privilege,
+        device_path,
+        attach_child
+            .as_mut()
+            .context("attach child missing for session 2")?,
+        attach_log_session2,
+        Duration::from_secs(30),
+    )?;
+
+    mount_device(privilege, device_path, mount_dir)?;
+    *mounted = true;
+
+    let roundtrip = fs::read(payload_path)
+        .with_context(|| format!("failed to read payload from {}", payload_path.display()))?;
+    if roundtrip != payload {
+        bail!(
+            "payload mismatch after detach/reattach roundtrip ({} bytes)",
+            payload.len()
+        );
+    }
+
+    let nested_roundtrip = fs::read(nested_file_path).with_context(|| {
+        format!(
+            "failed to read nested payload from {}",
+            nested_file_path.display()
+        )
+    })?;
+    if nested_roundtrip != nested_payload {
+        bail!(
+            "nested payload mismatch after detach/reattach roundtrip ({} bytes)",
+            nested_payload.len()
+        );
+    }
+
+    let copied_roundtrip = fs::read(copied_file_path).with_context(|| {
+        format!(
+            "failed to read copied payload from {}",
+            copied_file_path.display()
+        )
+    })?;
+    if copied_roundtrip != nested_payload {
+        bail!(
+            "copied payload mismatch after detach/reattach roundtrip ({} bytes)",
+            nested_payload.len()
+        );
+    }
+
+    unmount_device(privilege, mount_dir)?;
+    *mounted = false;
+
+    stop_attach_process(
+        attach_child
+            .as_mut()
+            .context("attach child missing while stopping session 2")?,
+        attach_log_session2,
+        Duration::from_secs(15),
+    )?;
+    *attach_child = None;
+    *active_attach_log = None;
+    wait_for_device_detached(device_name, Duration::from_secs(10))?;
+    Ok(())
 }
 
 fn deterministic_payload(len: usize) -> Vec<u8> {
@@ -323,9 +437,9 @@ fn verify_raw_block_roundtrip(privilege: &PrivilegeMode, device_path: &Path) -> 
     result
 }
 
-async fn ensure_volume_exists(config: &SmokeConfig) -> anyhow::Result<()> {
-    let mut client = connect_workflow_client(config).await?;
-    let create_result = create_volume(
+async fn ensure_volume_exists(config: &support::workflow_smoke::SmokeConfig) -> anyhow::Result<()> {
+    let mut client = support::workflow_smoke::connect_workflow_client(config).await?;
+    let create_result = support::workflow_smoke::create_volume(
         &mut client,
         config,
         format!("nbd-e2e-req-{}", Uuid::new_v4().simple()),
@@ -496,6 +610,22 @@ fn wait_for_device_ready(
     )
 }
 
+fn wait_for_device_detached(device_name: &str, timeout_after: Duration) -> anyhow::Result<()> {
+    let deadline = Instant::now() + timeout_after;
+    while Instant::now() < deadline {
+        if nbd_device_pid(device_name)?.is_none() {
+            return Ok(());
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+
+    bail!(
+        "device {} still attached after {}s",
+        device_name,
+        timeout_after.as_secs()
+    )
+}
+
 fn mount_device(
     privilege: &PrivilegeMode,
     device_path: &Path,
@@ -529,41 +659,136 @@ fn stop_attach_process(
     attach_log_path: &Path,
     timeout_after: Duration,
 ) -> anyhow::Result<()> {
-    let pid = i32::try_from(attach_child.id()).context("attach process PID does not fit i32")?;
-    let _ = unsafe { libc::kill(pid, libc::SIGINT) };
+    stop_attach_process_impl(
+        attach_child,
+        attach_log_path,
+        timeout_after,
+        StopFailureDisposition::Fail,
+    )
+}
 
-    let deadline = Instant::now() + timeout_after;
-    while Instant::now() < deadline {
+fn stop_attach_process_cleanup(
+    attach_child: &mut Child,
+    attach_log_path: &Path,
+    timeout_after: Duration,
+) -> anyhow::Result<()> {
+    stop_attach_process_impl(
+        attach_child,
+        attach_log_path,
+        timeout_after,
+        StopFailureDisposition::LogAndContinue,
+    )
+}
+
+#[derive(Clone, Copy)]
+enum StopFailureDisposition {
+    Fail,
+    LogAndContinue,
+}
+
+fn stop_attach_process_impl(
+    attach_child: &mut Child,
+    attach_log_path: &Path,
+    timeout_after: Duration,
+    disposition: StopFailureDisposition,
+) -> anyhow::Result<()> {
+    if matches!(disposition, StopFailureDisposition::LogAndContinue) {
         if let Some(status) = attach_child
             .try_wait()
-            .context("failed while waiting for attach shutdown")?
+            .context("failed to poll attach process during cleanup")?
         {
-            if status.success() {
-                return Ok(());
-            }
-            let signal_suffix = status
-                .signal()
-                .map(|sig| format!(", signal {sig}"))
-                .unwrap_or_default();
-            bail!(
-                "attach exited non-zero: status {}{}\nlog tail:\n{}",
+            return report_attach_stop_status(
                 status,
-                signal_suffix,
-                log_tail(attach_log_path, 120)
+                attach_log_path,
+                disposition,
+                "attach process already exited during cleanup",
             );
+        }
+    }
+
+    let pid_context = match disposition {
+        StopFailureDisposition::Fail => "attach process PID does not fit i32",
+        StopFailureDisposition::LogAndContinue => "cleanup: attach process PID does not fit i32",
+    };
+    let pid = i32::try_from(attach_child.id()).context(pid_context)?;
+    let _ = unsafe { libc::kill(pid, libc::SIGINT) };
+
+    let wait_context = match disposition {
+        StopFailureDisposition::Fail => "failed while waiting for attach shutdown",
+        StopFailureDisposition::LogAndContinue => {
+            "cleanup: failed while waiting for attach shutdown"
+        }
+    };
+    let deadline = Instant::now() + timeout_after;
+    while Instant::now() < deadline {
+        if let Some(status) = attach_child.try_wait().context(wait_context)? {
+            let status_message = match disposition {
+                StopFailureDisposition::Fail => "attach exited non-zero",
+                StopFailureDisposition::LogAndContinue => {
+                    "attach process exited non-zero during cleanup"
+                }
+            };
+            return report_attach_stop_status(status, attach_log_path, disposition, status_message);
         }
         thread::sleep(Duration::from_millis(100));
     }
 
     let _ = attach_child.kill();
-    let status = attach_child
-        .wait()
-        .context("failed to wait for forced attach process kill")?;
-    bail!(
-        "attach did not stop after SIGINT; forced kill status {}\nlog tail:\n{}",
+    let forced_wait_context = match disposition {
+        StopFailureDisposition::Fail => "failed to wait for forced attach process kill",
+        StopFailureDisposition::LogAndContinue => {
+            "cleanup: failed to wait for forced attach process kill"
+        }
+    };
+    let status = attach_child.wait().context(forced_wait_context)?;
+
+    match disposition {
+        StopFailureDisposition::Fail => bail!(
+            "attach did not stop after SIGINT; forced kill status {}\nlog tail:\n{}",
+            status,
+            log_tail(attach_log_path, 120)
+        ),
+        StopFailureDisposition::LogAndContinue => {
+            if !status.success() {
+                eprintln!(
+                    "attach process forced-kill status during cleanup: {}\nlog tail:\n{}",
+                    status,
+                    log_tail(attach_log_path, 120)
+                );
+            }
+            Ok(())
+        }
+    }
+}
+
+fn report_attach_stop_status(
+    status: std::process::ExitStatus,
+    attach_log_path: &Path,
+    disposition: StopFailureDisposition,
+    message: &str,
+) -> anyhow::Result<()> {
+    if status.success() {
+        return Ok(());
+    }
+
+    let signal_suffix = status
+        .signal()
+        .map(|sig| format!(", signal {sig}"))
+        .unwrap_or_default();
+    let detailed = format!(
+        "{message}: status {}{}\nlog tail:\n{}",
         status,
+        signal_suffix,
         log_tail(attach_log_path, 120)
-    )
+    );
+
+    match disposition {
+        StopFailureDisposition::Fail => bail!("{detailed}"),
+        StopFailureDisposition::LogAndContinue => {
+            eprintln!("{detailed}");
+            Ok(())
+        }
+    }
 }
 
 fn device_size_bytes(privilege: &PrivilegeMode, device_path: &Path) -> anyhow::Result<u64> {

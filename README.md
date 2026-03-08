@@ -6,22 +6,23 @@ See also:
 - `DESIGN.md` for architecture.
 - `CONTRIBUTING.md` for branch pairing, build, and remote test workflows.
 
-## Modes
+## Runtime
 
-- `smoke` (default): Create/Open/Write/Read contract validation against frontend `workflowservice`.
+- `create-volume`: Provision one Temporal volume.
 - `attach`: Attach one Temporal volume to one Linux NBD device and serve `READ`, `WRITE`, `FLUSH`, `DISC`.
+- `create_volume_smoke` test: workflowservice Create/Open/Write/Read contract validation lives in `tests/create_volume_smoke.rs` (validation, not provisioning flow).
 
 ## Prereqs
 
 - Temporal server running with blockdevice module exposed via frontend/workflowservice.
 - Temporal namespace (name, not namespace ID).
-- Linux host for `attach` mode.
+- Linux host for attach runtime.
 - NBD kernel module loaded (`sudo modprobe nbd max_part=0`).
 - NBD device node available (for example `/dev/nbd0`).
 - Permission to open/configure `/dev/nbdX` (typically root).
 - Build-time proto source: set `TEMPORAL_API_REPO` only when compiling if your API checkout is not at `../api`.
 
-## Smoke Mode
+## Smoke E2E Test
 
 Required env:
 
@@ -40,10 +41,34 @@ Optional env:
 Run:
 
 ```bash
-cargo run
-# or
-cargo run -- smoke
+cargo test --test create_volume_smoke -- --nocapture
 ```
+
+## Create Volume Mode
+
+Create required options:
+
+- namespace (`--namespace` or `TEMPORAL_NAMESPACE`)
+- volume id (`--volume-id` or `TEMPORAL_VOLUME_ID`)
+
+Typical run:
+
+```bash
+cargo run -- create-volume \
+  --namespace default \
+  --volume-id my-volume \
+  --size-bytes 1073741824
+```
+
+Create flags (all also support env vars):
+
+- `--frontend-endpoint` / `TEMPORAL_FRONTEND_ENDPOINT` (default `127.0.0.1:7233`)
+- `--size-bytes` / `TEMPORAL_VOLUME_SIZE_BYTES` (default `1073741824`)
+- `--block-size-bytes` / `TEMPORAL_VOLUME_BLOCK_SIZE_BYTES` (default `0`, let server choose)
+- `--connect-timeout-secs` / `TEMPORAL_CONNECT_TIMEOUT_SECS` (default `5`)
+- `--rpc-timeout-secs` / `TEMPORAL_RPC_TIMEOUT_SECS` (default `5`)
+- `--request-id` / `TEMPORAL_CREATE_REQUEST_ID` (default: auto-generated)
+- `--if-not-exists` / `TEMPORAL_CREATE_IF_NOT_EXISTS` (default `false`)
 
 ## Attach Mode
 
@@ -61,6 +86,8 @@ sudo cargo run -- attach \
   --nbd-device /dev/nbd0
 ```
 
+`attach` opens an existing volume and fails if it does not exist.
+
 ## Using Precompiled Binaries
 
 If you already have a built `temporal-nbd` binary, use it directly instead of `cargo run`.
@@ -73,8 +100,12 @@ export TEMPORAL_FRONTEND_ENDPOINT=127.0.0.1:7233
 export TEMPORAL_NAMESPACE=default
 export TEMPORAL_VOLUME_ID=my-volume
 
-# Smoke
-"$TEMPORAL_NBD_BIN" smoke
+# Create volume once
+"$TEMPORAL_NBD_BIN" create-volume \
+  --frontend-endpoint "$TEMPORAL_FRONTEND_ENDPOINT" \
+  --namespace "$TEMPORAL_NAMESPACE" \
+  --volume-id "$TEMPORAL_VOLUME_ID" \
+  --size-bytes 1073741824
 
 # Attach
 sudo "$TEMPORAL_NBD_BIN" attach \
@@ -101,10 +132,14 @@ export TEMPORAL_NAMESPACE=default
 export TEMPORAL_VOLUME_ID=my-volume
 ```
 
-2. Create/open the volume once (smoke mode does this and validates API behavior).
+2. Create the volume once.
 
 ```bash
-cargo run -- smoke
+cargo run -- create-volume \
+  --frontend-endpoint "$TEMPORAL_FRONTEND_ENDPOINT" \
+  --namespace "$TEMPORAL_NAMESPACE" \
+  --volume-id "$TEMPORAL_VOLUME_ID" \
+  --size-bytes 1073741824
 ```
 
 3. Start attach mode in terminal A.
