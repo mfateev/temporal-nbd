@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 use anyhow::{anyhow, bail, Context};
 use std::env;
 use std::fs;
@@ -18,18 +16,21 @@ pub struct SmokeConfig {
     pub volume_id: String,
     pub size_bytes: u64,
     pub block_size_bytes: u32,
+    #[allow(dead_code)]
     pub volume_id_file: PathBuf,
     pub connect_timeout: Duration,
     pub rpc_timeout: Duration,
 }
 
 #[derive(Clone, Debug)]
+#[allow(dead_code)]
 pub struct BlockWriteInput {
     pub lba: u64,
     pub data: Vec<u8>,
 }
 
 impl SmokeConfig {
+    #[allow(dead_code)]
     pub fn from_env() -> anyhow::Result<Self> {
         let frontend_endpoint =
             env::var("TEMPORAL_FRONTEND_ENDPOINT").unwrap_or_else(|_| "127.0.0.1:7233".to_string());
@@ -80,6 +81,7 @@ impl SmokeConfig {
     }
 }
 
+#[allow(dead_code)]
 pub async fn run_phase2_workflowservice_smoke(config: &SmokeConfig) -> anyhow::Result<()> {
     let mut client = connect_workflow_client(config).await?;
 
@@ -301,6 +303,7 @@ pub async fn create_volume(
     Ok(response?.into_inner())
 }
 
+#[allow(dead_code)]
 pub async fn open_volume(
     client: &mut WorkflowServiceClient,
     namespace: &str,
@@ -319,6 +322,7 @@ pub async fn open_volume(
     Ok(response?.into_inner())
 }
 
+#[allow(dead_code)]
 pub async fn write_batch(
     client: &mut WorkflowServiceClient,
     namespace: &str,
@@ -362,6 +366,7 @@ pub async fn write_batch(
     Ok(response?.into_inner())
 }
 
+#[allow(dead_code)]
 pub async fn read_blocks(
     client: &mut WorkflowServiceClient,
     namespace: &str,
@@ -441,4 +446,79 @@ fn persist_volume_id(path: &Path, volume_id: &str) -> anyhow::Result<()> {
     }
     fs::write(path, format!("{volume_id}\n"))
         .with_context(|| format!("write volume id file {}", path.display()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_config() -> SmokeConfig {
+        SmokeConfig {
+            frontend_endpoint: "127.0.0.1:7233".to_string(),
+            namespace: "default".to_string(),
+            volume_id: "volume-id".to_string(),
+            size_bytes: 1 << 30,
+            block_size_bytes: 4096,
+            volume_id_file: PathBuf::from("/tmp/volume-id.txt"),
+            connect_timeout: Duration::from_secs(3),
+            rpc_timeout: Duration::from_secs(5),
+        }
+    }
+
+    #[test]
+    fn normalize_endpoint_adds_http_when_missing() {
+        assert_eq!(
+            normalize_endpoint("127.0.0.1:7233"),
+            "http://127.0.0.1:7233"
+        );
+    }
+
+    #[test]
+    fn normalize_endpoint_keeps_existing_scheme() {
+        assert_eq!(
+            normalize_endpoint("http://127.0.0.1:7233"),
+            "http://127.0.0.1:7233"
+        );
+        assert_eq!(
+            normalize_endpoint("https://example.com:443"),
+            "https://example.com:443"
+        );
+    }
+
+    #[test]
+    fn persist_volume_id_writes_expected_content() {
+        let out = PathBuf::from(format!(
+            "/tmp/temporal-nbd-test-{}.txt",
+            Uuid::new_v4().simple()
+        ));
+        persist_volume_id(&out, "volume-abc").expect("persist should succeed");
+        let content = fs::read_to_string(&out).expect("must read written file");
+        assert_eq!(content, "volume-abc\n");
+        fs::remove_file(out).ok();
+    }
+
+    #[test]
+    fn build_create_volume_request_sets_workflowservice_fields() {
+        let config = sample_config();
+        let request = build_create_volume_request(&config, "req-123".to_string())
+            .expect("request should build");
+
+        assert_eq!(request.namespace, config.namespace);
+        assert_eq!(request.volume_id, config.volume_id);
+        assert_eq!(request.size_bytes, config.size_bytes as i64);
+        assert_eq!(request.block_size_bytes, config.block_size_bytes as i32);
+        assert_eq!(request.request_id, "req-123");
+    }
+
+    #[test]
+    fn validate_create_volume_response_rejects_empty_run_id() {
+        let response = workflowservicepb::CreateVolumeResponse {
+            volume_id: "volume-id".to_string(),
+            run_id: String::new(),
+        };
+
+        let err = validate_create_volume_response(&response, "volume-id")
+            .expect_err("empty run id must fail");
+        assert!(err.to_string().contains("empty run_id"));
+    }
 }
