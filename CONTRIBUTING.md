@@ -8,7 +8,7 @@ As of 2026-03-08, the expected branch set is:
 
 | Repo | Branch | Why |
 | --- | --- | --- |
-| `temporal-nbd` | `phase1-smoke-client` | Rust client and tests for blockdevice attach flow |
+| `temporal-nbd` | `main` | Rust client and tests for blockdevice attach flow |
 | `temporal` | `blockdevice` | Server-side CHASM blockdevice implementation |
 | `api` | `blockdevice` | `workflowservice` volume RPC proto definitions used at build time |
 
