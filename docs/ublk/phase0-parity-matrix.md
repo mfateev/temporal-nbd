@@ -12,7 +12,7 @@ Disposition values:
 - `Deferred`: intentionally out of v1, tracked in follow-on phases.
 - `Not supported`: intentionally unsupported in v1 and surfaced explicitly.
 
-## Control-Plane Capabilities
+## Control-Plane Capabilities (`AddDevice`, `RemoveDevice`, `ListDevices`, `Health`)
 
 | Capability | Current `temporal-nbd` baseline | UBLK v1 disposition | Phase 0 pass/fail criterion |
 | --- | --- | --- | --- |
@@ -20,9 +20,10 @@ Disposition values:
 | Open existing volume for attach | `attach` opens volume with `OpenVolume` before serving I/O | Required for v1 | `temporal-ublk attach` fails fast on open failure; success path exposes usable Linux block device |
 | Single-device attach | One process attaches one volume to `/dev/nbdX` | Required for v1 | `temporal-ublk attach` supports one attached volume/device per process with graceful shutdown |
 | Multi-device attach manager | Not supported | Required for v1 | `temporal-ublk serve` can add/remove/list at least 2 concurrent devices in one process |
-| Device removal (`detach`) | NBD disconnect path performs best-effort final flush and teardown | Required for v1 | Remove operation transitions device to drained or force-detached terminal state with explicit status |
-| Device listing | Not supported | Required for v1 | `ListDevices` returns state for all active and terminal-recent devices with unique `device_id` and `volume_id` |
-| Health query | Not supported | Required for v1 | `Health` operation returns process health plus degraded device set |
+| Control op: `AddDevice` | Not supported | Required for v1 | `AddDevice` creates one attachment and returns stable `device_id` + `device_path`; replay with same idempotency key returns prior result |
+| Control op: `RemoveDevice` (`detach`) | NBD disconnect path performs best-effort final flush and teardown | Required for v1 | Remove operation transitions device to drained or force-detached terminal state with explicit status |
+| Control op: `ListDevices` | Not supported | Required for v1 | `ListDevices` returns state for all active and terminal-recent devices with unique `device_id` and `volume_id` |
+| Control op: `Health` | Not supported | Required for v1 | `Health` operation returns process health plus degraded device list |
 | Duplicate same-volume attach protection in one process | Implicitly single attach per process | Required for v1 | `AddDevice` rejects duplicate `volume_id` in same manager process |
 | Explicit resize operation | Not supported in client | Deferred | No resize API in v1 manager contract; documented as follow-up |
 | Explicit delete operation | Not supported in client | Deferred | No delete API in v1 manager contract; documented as follow-up |
@@ -42,7 +43,7 @@ Disposition values:
 | Dirty high-watermark pressure flush | Implemented in engine | Required for v1 | Exceeding dirty watermark triggers synchronous flush attempt |
 | Unsupported op: discard | NBD side currently rejects unsupported commands | Not supported | UBLK discard returns `EOPNOTSUPP` and does not mutate data |
 | Unsupported op: write-zeroes | Not implemented | Not supported | UBLK write-zeroes returns `EOPNOTSUPP` and does not mutate data |
-| FUA semantics | NBD command flags are not modeled separately | Required for v1 | UBLK write requests with FUA trigger flush-equivalent durability before completion |
+| FUA semantics | NBD command flags are not modeled separately | Required for v1 | UBLK FUA write is handled as `Write` followed immediately by `Flush`; completion is returned only after both succeed |
 
 ## Failure and Recovery Semantics
 

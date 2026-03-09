@@ -25,11 +25,16 @@ Request:
 {
   "version": "v1",
   "request_id": "string",
-  "idempotency_key": "string",
+  "idempotency_key": "string|null",
   "op": "AddDevice|RemoveDevice|ListDevices|Health",
   "body": {}
 }
 ```
+
+`idempotency_key` handling:
+- Required and non-empty for mutating ops: `AddDevice`, `RemoveDevice`.
+- Optional for read-only ops: `ListDevices`, `Health`.
+- If supplied on read-only ops, it is accepted and logged for trace correlation but ignored for semantic behavior.
 
 Response:
 ```json
@@ -61,10 +66,10 @@ Error response:
 
 | Operation | Required request fields | Success result | Idempotency behavior |
 | --- | --- | --- | --- |
-| `AddDevice` | `volume_id`, optional `ublk_device_id`, optional per-device overrides | `device_id`, `device_path`, `volume_id`, `state` | Same `idempotency_key` with equivalent body returns original result |
-| `RemoveDevice` | `device_id` or `volume_id`, optional `force` | terminal state (`Detached` or `ForceDetached`) | Repeated remove for already detached device returns success no-op |
-| `ListDevices` | optional filter fields | full device list with states and last error | Pure read; idempotent by definition |
-| `Health` | none | process health summary + degraded device list | Pure read; idempotent by definition |
+| `AddDevice` | `idempotency_key`, `volume_id`, optional `ublk_device_id`, optional per-device overrides | `device_id`, `device_path`, `volume_id`, `state` | Same `idempotency_key` with equivalent body returns original result |
+| `RemoveDevice` | `idempotency_key`, `device_id` or `volume_id`, optional `force` | terminal state (`Detached` or `ForceDetached`) | Repeated remove for already detached device returns success no-op |
+| `ListDevices` | optional filter fields, optional `idempotency_key` | full device list with states and last error | Pure read; idempotent by definition |
+| `Health` | optional `idempotency_key` | process health summary + degraded device list | Pure read; idempotent by definition |
 
 `AddDevice` response must include a stable `device_path` (for example `/dev/ublkb7`) for that attachment lifetime.
 
@@ -104,7 +109,7 @@ Terminal states:
 
 ## Idempotency, Retries, and Compensation
 
-1. Manager requires `idempotency_key` for mutating operations (`AddDevice`, `RemoveDevice`).
+1. Manager requires `idempotency_key` for mutating operations (`AddDevice`, `RemoveDevice`) and rejects missing/empty values with `InvalidArgument`.
 2. Manager stores recent operation outcomes long enough to make client retries safe.
 3. Callers must retry timed-out mutating operations with the same `idempotency_key`.
 4. Duplicate `AddDevice` for same volume with different key is rejected unless prior device is removed.
@@ -117,7 +122,8 @@ Terminal states:
 UBLK operation mapping to bridge commands:
 - read -> `BridgeCommand::Read`
 - write -> `BridgeCommand::Write`
-- flush and write with FUA -> `BridgeCommand::Flush`
+- flush -> `BridgeCommand::Flush`
+- write with FUA -> `BridgeCommand::Write` then immediate `BridgeCommand::Flush` before completion
 - stop/teardown -> `BridgeCommand::Disconnect`
 - discard/write-zeroes -> reject with `EOPNOTSUPP`
 

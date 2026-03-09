@@ -25,6 +25,7 @@ Define objective, measurable gates that determine readiness for UBLK implementat
 | R3: Manager shutdown policy | `serve` shutdown with active devices and timeout paths | Graceful drain attempted first, forced detach only after timeout |
 | R4: Device failure isolation | Device task panic/termination in multi-device mode | Manager stays alive; unaffected devices continue serving |
 | R5: Restart semantics clarity | Stop/start manager with previously attached devices | Post-restart state is explicit and documented; no silent phantom devices |
+| R6: `Failed` state distinction | Inject non-timeout fatal errors (for example `OpeningVolume` failure or frontend initialization failure) | Device transitions to `Failed` (not `ForceDetached`) and is reported distinctly via `ListDevices`/`Health` |
 
 ## 3) Operability Gates
 
@@ -38,6 +39,10 @@ Define objective, measurable gates that determine readiness for UBLK implementat
 ## 4) Baseline Performance Gates
 
 Baseline comparison target: current `temporal-nbd` on same host, same volume geometry, same backend endpoint.
+
+Threshold rationale:
+- `>= 70%` IOPS and `<= 1.5x` p99 latency are Phase 1 baseline guardrails intended to catch major regressions while v1 prioritizes correctness and isolation-first architecture (one io_uring worker per device).
+- These values are placeholders pending first benchmark run and should be tightened once representative workload data is collected.
 
 | Gate | Measurement | Threshold |
 | --- | --- | --- |

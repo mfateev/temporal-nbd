@@ -2,7 +2,7 @@
 
 Status: Draft implementation target for Phase 0 (planning and contract lock).
 
-This folder contains the Phase 0 deliverables defined by `/home/dev/ublk-implementation-phase0.md`.
+This folder contains the Phase 0 deliverables defined by the ublk Phase 0 implementation plan.
 
 - `phase0-parity-matrix.md`: capability-by-capability parity target with objective pass/fail checks.
 - `phase0-v1-scope.md`: explicit v1 scope, non-goals, and compatibility/migration assumptions.
