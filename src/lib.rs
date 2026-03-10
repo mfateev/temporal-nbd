@@ -2,11 +2,13 @@ use tonic::transport::Channel;
 
 pub mod attach;
 pub mod bridge;
+pub mod control;
 pub mod create;
 pub mod engine;
 pub mod errors;
 pub mod nbd;
 pub mod session;
+pub mod ublk;
 
 pub mod temporal {
     pub mod api {
