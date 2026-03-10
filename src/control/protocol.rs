@@ -200,7 +200,7 @@ struct RequestEnvelope {
     request_id: String,
     #[serde(default)]
     idempotency_key: Option<String>,
-    op: Operation,
+    op: Value,
     #[serde(default = "empty_object")]
     body: Value,
 }
@@ -233,17 +233,16 @@ pub fn decode_request(payload: &[u8]) -> Result<ControlRequest, ProtocolError> {
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty());
 
-    if envelope.op.is_mutating() && idempotency_key.is_none() {
+    let op = parse_operation(Some(request_id.clone()), envelope.op)?;
+
+    if op.is_mutating() && idempotency_key.is_none() {
         return Err(ProtocolError::invalid(
             Some(request_id),
-            format!(
-                "idempotency_key is required and non-empty for {:?}",
-                envelope.op
-            ),
+            format!("idempotency_key is required and non-empty for {:?}", op),
         ));
     }
 
-    let body = match envelope.op {
+    let body = match op {
         Operation::AddDevice => {
             let body: AddDeviceRequest =
                 parse_body(Some(request_id.clone()), envelope.body, "AddDevice body")?;
@@ -289,6 +288,23 @@ pub fn decode_request(payload: &[u8]) -> Result<ControlRequest, ProtocolError> {
         idempotency_key,
         body,
     })
+}
+
+fn parse_operation(request_id: Option<String>, value: Value) -> Result<Operation, ProtocolError> {
+    let Value::String(value) = value else {
+        return Err(ProtocolError::invalid(request_id, "op must be a string"));
+    };
+
+    match value.as_str() {
+        "AddDevice" => Ok(Operation::AddDevice),
+        "RemoveDevice" => Ok(Operation::RemoveDevice),
+        "ListDevices" => Ok(Operation::ListDevices),
+        "Health" => Ok(Operation::Health),
+        _ => Err(ProtocolError::invalid(
+            request_id,
+            format!("unknown operation '{}'", value),
+        )),
+    }
 }
 
 fn parse_body<T: DeserializeOwned>(

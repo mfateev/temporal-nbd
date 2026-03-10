@@ -4,7 +4,8 @@ use crate::control::protocol::{
 };
 use crate::errors::TransportError;
 use crate::session::{RetryConfig, VolumeSession, VolumeSessionConfig};
-use crate::ublk::manager::{AddDeviceResult, ControlManager, RemoveDeviceResult};
+use crate::ublk::manager::{ControlManager, RemovePreparation};
+use crate::ublk::signal::wait_for_shutdown_signal;
 use anyhow::Context;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -101,9 +102,13 @@ pub async fn run_serve(config: ServeConfig) -> anyhow::Result<()> {
             write_ready_file(path)?;
         }
 
-        eprintln!(
-            "temporal-ublk serve listening on {}",
-            config.control_socket.display()
+        log_event(
+            "INFO",
+            "manager_listening",
+            &[(
+                "control_socket",
+                config.control_socket.display().to_string(),
+            )],
         );
 
         let manager = Arc::new(Mutex::new(ControlManager::new(
@@ -136,7 +141,7 @@ pub async fn run_serve(config: ServeConfig) -> anyhow::Result<()> {
                     let (stream, _addr) = match accept {
                         Ok(values) => values,
                         Err(err) => {
-                            eprintln!("control socket accept failed: {err}");
+                            log_event("ERROR", "control_accept_failed", &[("error", err.to_string())]);
                             continue;
                         }
                     };
@@ -154,13 +159,13 @@ pub async fn run_serve(config: ServeConfig) -> anyhow::Result<()> {
                         )
                         .await
                         {
-                            eprintln!("control connection terminated with error: {err}");
+                            log_event("ERROR", "control_connection_error", &[("error", err.to_string())]);
                         }
                     });
                 }
                 signal_name = &mut shutdown_signal => {
                     let signal_name = signal_name?;
-                    eprintln!("received {signal_name}, stopping control accept loop");
+                    log_event("INFO", "manager_shutdown_signal", &[("signal", signal_name.to_string())]);
                     break;
                 }
             }
@@ -168,7 +173,7 @@ pub async fn run_serve(config: ServeConfig) -> anyhow::Result<()> {
 
         while let Some(result) = tasks.join_next().await {
             if let Err(err) = result {
-                eprintln!("control connection task join error: {err}");
+                log_event("ERROR", "control_join_error", &[("error", err.to_string())]);
             }
         }
 
@@ -194,8 +199,7 @@ async fn handle_connection(
             Ok(Some(payload)) => payload,
             Ok(None) => return Ok(()),
             Err(err) => {
-                eprintln!("frame read failed: {err}");
-                return Ok(());
+                return Err(anyhow::anyhow!("frame read failed: {err}"));
             }
         };
 
@@ -228,12 +232,16 @@ async fn process_request(
     runtime_config: Arc<RuntimeConfig>,
     mutating_serial: Arc<Mutex<()>>,
 ) -> ResponseEnvelope {
+    let request_id = request.request_id.clone();
+    let idempotency_key = request.idempotency_key.clone().unwrap_or_default();
+    let fingerprint = request.body_fingerprint().unwrap_or_default();
+
     match request.body {
         RequestBody::AddDevice(body) => {
-            let idempotency_key = request.idempotency_key.unwrap_or_default();
             process_add_device(
-                request.request_id,
+                request_id,
                 idempotency_key,
+                fingerprint,
                 body,
                 manager,
                 runtime_devices,
@@ -243,10 +251,10 @@ async fn process_request(
             .await
         }
         RequestBody::RemoveDevice(body) => {
-            let idempotency_key = request.idempotency_key.unwrap_or_default();
             process_remove_device(
-                request.request_id,
+                request_id,
                 idempotency_key,
+                fingerprint,
                 body,
                 manager,
                 runtime_devices,
@@ -257,11 +265,11 @@ async fn process_request(
         }
         RequestBody::ListDevices(body) => {
             let guard = manager.lock().await;
-            guard.list_devices(request.request_id, body)
+            guard.list_devices(request_id, body)
         }
         RequestBody::Health(_) => {
             let guard = manager.lock().await;
-            guard.health(request.request_id)
+            guard.health(request_id)
         }
     }
 }
@@ -269,74 +277,40 @@ async fn process_request(
 async fn process_add_device(
     request_id: String,
     idempotency_key: String,
+    fingerprint: Vec<u8>,
     body: AddDeviceRequest,
     manager: Arc<Mutex<ControlManager>>,
     runtime_devices: RuntimeDevices,
     runtime_config: Arc<RuntimeConfig>,
     mutating_serial: Arc<Mutex<()>>,
 ) -> ResponseEnvelope {
-    let fingerprint = serde_json::to_vec(&body).unwrap_or_default();
     let _serial_guard = mutating_serial.lock().await;
 
-    {
-        let guard = manager.lock().await;
-        if let Some(response) = guard.lookup_cached_mutating_outcome(
+    let reservation = {
+        let mut guard = manager.lock().await;
+        if let Some(cached) = guard.lookup_cached_mutating_outcome(
             request_id.clone(),
             &idempotency_key,
             Operation::AddDevice,
             &fingerprint,
         ) {
-            return response;
+            return cached;
         }
-    }
 
-    let start = start_runtime_task(body.volume_id.clone(), runtime_config.clone()).await;
-    let runtime_device = match start {
-        Ok(device) => device,
-        Err(err) => {
-            let response = ResponseEnvelope::error(request_id.clone(), err.code, err.message);
-            let mut guard = manager.lock().await;
-            guard.cache_mutating_outcome(
-                idempotency_key,
-                Operation::AddDevice,
-                fingerprint,
-                &response,
-            );
-            return response;
-        }
-    };
-
-    let response = {
-        let mut guard = manager.lock().await;
-        guard.add_device(request_id.clone(), body)
-    };
-
-    if response.ok {
-        let add_result: Result<AddDeviceResult, _> = response
-            .result
-            .as_ref()
-            .cloned()
-            .ok_or_else(|| anyhow::anyhow!("missing add result"))
-            .and_then(|value| {
-                serde_json::from_value(value)
-                    .map_err(|err| anyhow::anyhow!("invalid add response schema: {err}"))
-            });
-        match add_result {
-            Ok(add_result) => {
-                runtime_devices
-                    .lock()
-                    .await
-                    .insert(add_result.device_id, runtime_device);
+        match guard.reserve_add_device(request_id.clone(), &body) {
+            Ok(reservation) => {
+                if let Err(response) = guard.mark_device_opening(reservation.device_id) {
+                    guard.cache_mutating_outcome(
+                        idempotency_key,
+                        Operation::AddDevice,
+                        fingerprint,
+                        &response,
+                    );
+                    return response;
+                }
+                reservation
             }
-            Err(err) => {
-                runtime_device.shutdown.cancel();
-                let _ = runtime_device.task.await;
-                let response = ResponseEnvelope::error(
-                    request_id.clone(),
-                    ErrorCode::Internal,
-                    format!("failed to start runtime task: {err}"),
-                );
-                let mut guard = manager.lock().await;
+            Err(response) => {
                 guard.cache_mutating_outcome(
                     idempotency_key,
                     Operation::AddDevice,
@@ -346,12 +320,45 @@ async fn process_add_device(
                 return response;
             }
         }
-    } else {
-        runtime_device.shutdown.cancel();
-        let _ = runtime_device.task.await;
-    }
+    };
+
+    let runtime_device =
+        match start_runtime_task(reservation.volume_id.clone(), runtime_config.clone()).await {
+            Ok(device) => device,
+            Err(err) => {
+                let mut guard = manager.lock().await;
+                let response = guard.fail_add_device(
+                    request_id.clone(),
+                    reservation.device_id,
+                    err.code,
+                    err.message,
+                );
+                guard.cache_mutating_outcome(
+                    idempotency_key,
+                    Operation::AddDevice,
+                    fingerprint,
+                    &response,
+                );
+                return response;
+            }
+        };
+
+    runtime_devices
+        .lock()
+        .await
+        .insert(reservation.device_id, runtime_device);
 
     let mut guard = manager.lock().await;
+    let response = guard.finalize_add_success(request_id.clone(), reservation.device_id);
+    if !response.ok {
+        let _ = stop_runtime_device(
+            reservation.device_id,
+            &runtime_devices,
+            &runtime_config,
+            true,
+        )
+        .await;
+    }
     guard.cache_mutating_outcome(
         idempotency_key,
         Operation::AddDevice,
@@ -364,54 +371,54 @@ async fn process_add_device(
 async fn process_remove_device(
     request_id: String,
     idempotency_key: String,
+    fingerprint: Vec<u8>,
     body: RemoveDeviceRequest,
     manager: Arc<Mutex<ControlManager>>,
     runtime_devices: RuntimeDevices,
     runtime_config: Arc<RuntimeConfig>,
     mutating_serial: Arc<Mutex<()>>,
 ) -> ResponseEnvelope {
-    let fingerprint = serde_json::to_vec(&body).unwrap_or_default();
     let _serial_guard = mutating_serial.lock().await;
 
-    {
-        let guard = manager.lock().await;
-        if let Some(response) = guard.lookup_cached_mutating_outcome(
+    let prep = {
+        let mut guard = manager.lock().await;
+        if let Some(cached) = guard.lookup_cached_mutating_outcome(
             request_id.clone(),
             &idempotency_key,
             Operation::RemoveDevice,
             &fingerprint,
         ) {
-            return response;
+            return cached;
         }
-    }
-
-    let response = {
-        let mut guard = manager.lock().await;
-        guard.remove_device(request_id.clone(), body.clone())
+        guard.prepare_remove_device(request_id.clone(), &body)
     };
 
-    if response.ok {
-        let remove_result: Result<RemoveDeviceResult, _> = response
-            .result
-            .as_ref()
-            .cloned()
-            .ok_or_else(|| anyhow::anyhow!("missing remove result"))
-            .and_then(|value| {
-                serde_json::from_value(value)
-                    .map_err(|err| anyhow::anyhow!("invalid remove response schema: {err}"))
-            });
-
-        if let Ok(remove_result) = remove_result {
-            if !remove_result.noop {
-                if let Some(device_id) = remove_result.device_id {
-                    stop_runtime_device(device_id, &runtime_devices, &runtime_config, body.force)
-                        .await;
-                }
-            }
+    let (device_id, mut force_detach) = match prep {
+        RemovePreparation::Immediate(response) => {
+            let mut guard = manager.lock().await;
+            guard.cache_mutating_outcome(
+                idempotency_key,
+                Operation::RemoveDevice,
+                fingerprint,
+                &response,
+            );
+            return response;
         }
+        RemovePreparation::Draining {
+            device_id,
+            volume_id: _volume_id,
+            force,
+        } => (device_id, force),
+    };
+
+    let timed_out =
+        stop_runtime_device(device_id, &runtime_devices, &runtime_config, force_detach).await;
+    if timed_out {
+        force_detach = true;
     }
 
     let mut guard = manager.lock().await;
+    let response = guard.complete_remove_device(request_id, device_id, force_detach);
     guard.cache_mutating_outcome(
         idempotency_key,
         Operation::RemoveDevice,
@@ -515,10 +522,10 @@ async fn stop_runtime_device(
     runtime_devices: &RuntimeDevices,
     runtime_config: &RuntimeConfig,
     force: bool,
-) {
+) -> bool {
     let runtime = runtime_devices.lock().await.remove(&device_id);
     let Some(runtime) = runtime else {
-        return;
+        return false;
     };
 
     runtime.shutdown.cancel();
@@ -530,14 +537,27 @@ async fn stop_runtime_device(
     match timeout(wait_duration, runtime.task).await {
         Ok(join_result) => {
             if let Err(err) = join_result {
-                eprintln!("runtime task join error for device {}: {err}", device_id);
+                log_event(
+                    "ERROR",
+                    "runtime_task_join_error",
+                    &[
+                        ("device_id", device_id.to_string()),
+                        ("error", err.to_string()),
+                    ],
+                );
             }
+            false
         }
         Err(_) => {
-            eprintln!(
-                "runtime task stop timeout for device {} (force={})",
-                device_id, force
+            log_event(
+                "WARN",
+                "runtime_task_stop_timeout",
+                &[
+                    ("device_id", device_id.to_string()),
+                    ("force", force.to_string()),
+                ],
             );
+            true
         }
     }
 }
@@ -549,9 +569,15 @@ async fn shutdown_runtime_devices(
     let devices = std::mem::take(&mut *runtime_devices.lock().await);
     for (device_id, runtime) in devices {
         runtime.shutdown.cancel();
-        let wait = timeout(runtime_config.graceful_drain_timeout, runtime.task).await;
-        if let Err(_) = wait {
-            eprintln!("runtime shutdown timeout for device {}", device_id);
+        if timeout(runtime_config.graceful_drain_timeout, runtime.task)
+            .await
+            .is_err()
+        {
+            log_event(
+                "WARN",
+                "runtime_shutdown_timeout",
+                &[("device_id", device_id.to_string())],
+            );
         }
     }
 }
@@ -586,29 +612,14 @@ fn write_ready_file(path: &Path) -> anyhow::Result<()> {
         .with_context(|| format!("failed to write ready file {}", path.display()))
 }
 
-async fn wait_for_shutdown_signal() -> anyhow::Result<&'static str> {
-    #[cfg(unix)]
-    {
-        use tokio::signal::unix::{signal, SignalKind};
-
-        let mut sigint =
-            signal(SignalKind::interrupt()).context("failed to install SIGINT handler")?;
-        let mut sigterm =
-            signal(SignalKind::terminate()).context("failed to install SIGTERM handler")?;
-
-        tokio::select! {
-            _ = sigint.recv() => Ok("SIGINT"),
-            _ = sigterm.recv() => Ok("SIGTERM"),
-        }
+fn log_event(level: &str, event: &str, fields: &[(&str, String)]) {
+    let mut parts = Vec::with_capacity(fields.len() + 2);
+    parts.push(format!("level={level}"));
+    parts.push(format!("event={event}"));
+    for (key, value) in fields {
+        parts.push(format!("{key}={value}"));
     }
-
-    #[cfg(not(unix))]
-    {
-        tokio::signal::ctrl_c()
-            .await
-            .context("failed to wait for ctrl-c signal")?;
-        Ok("CTRL-C")
-    }
+    eprintln!("{}", parts.join(" "));
 }
 
 #[cfg(test)]

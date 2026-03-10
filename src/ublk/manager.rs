@@ -1,10 +1,12 @@
 use crate::control::protocol::{
-    AddDeviceRequest, ControlRequest, ErrorBody, ErrorCode, ListDevicesRequest, Operation,
-    RemoveDeviceRequest, RequestBody, ResponseEnvelope,
+    AddDeviceRequest, ErrorBody, ErrorCode, ListDevicesRequest, Operation, RemoveDeviceRequest,
+    ResponseEnvelope,
 };
+#[cfg(test)]
+use crate::control::protocol::{ControlRequest, RequestBody};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub enum DeviceState {
@@ -82,6 +84,23 @@ pub struct HealthResult {
 }
 
 #[derive(Clone, Debug)]
+pub struct AddDeviceReservation {
+    pub device_id: u32,
+    pub device_path: String,
+    pub volume_id: String,
+}
+
+#[derive(Clone, Debug)]
+pub enum RemovePreparation {
+    Immediate(ResponseEnvelope),
+    Draining {
+        device_id: u32,
+        volume_id: String,
+        force: bool,
+    },
+}
+
+#[derive(Clone, Debug)]
 struct DeviceRecord {
     device_id: u32,
     volume_id: String,
@@ -144,6 +163,7 @@ pub struct ControlManager {
     devices: BTreeMap<u32, DeviceRecord>,
     active_volume_to_device: HashMap<String, u32>,
     idempotency_cache: HashMap<String, CachedIdempotentOutcome>,
+    idempotency_order: VecDeque<String>,
 }
 
 impl ControlManager {
@@ -161,24 +181,59 @@ impl ControlManager {
             devices: BTreeMap::new(),
             active_volume_to_device: HashMap::new(),
             idempotency_cache: HashMap::new(),
+            idempotency_order: VecDeque::new(),
         }
     }
 
+    #[cfg(test)]
     pub fn handle_request(&mut self, request: ControlRequest) -> ResponseEnvelope {
-        let request_id = request.request_id.clone();
+        let request_id = request.request_id;
         match request.body {
             RequestBody::AddDevice(body) => {
                 let key = request.idempotency_key.unwrap_or_default();
                 let fingerprint = serde_json::to_vec(&body).unwrap_or_default();
-                self.handle_add_with_idempotency(request_id, key, fingerprint, body)
+                if let Some(cached) = self.lookup_cached_mutating_outcome(
+                    request_id.clone(),
+                    &key,
+                    Operation::AddDevice,
+                    &fingerprint,
+                ) {
+                    return cached;
+                }
+
+                let response = match self.reserve_add_device(request_id.clone(), &body) {
+                    Ok(reservation) => {
+                        let _ = self.mark_device_opening(reservation.device_id);
+                        self.finalize_add_success(request_id, reservation.device_id)
+                    }
+                    Err(response) => response,
+                };
+                self.cache_mutating_outcome(key, Operation::AddDevice, fingerprint, &response);
+                response
             }
             RequestBody::RemoveDevice(body) => {
                 let key = request.idempotency_key.unwrap_or_default();
                 let fingerprint = serde_json::to_vec(&body).unwrap_or_default();
-                self.handle_remove_with_idempotency(request_id, key, fingerprint, body)
+                if let Some(cached) = self.lookup_cached_mutating_outcome(
+                    request_id.clone(),
+                    &key,
+                    Operation::RemoveDevice,
+                    &fingerprint,
+                ) {
+                    return cached;
+                }
+
+                let response = match self.prepare_remove_device(request_id.clone(), &body) {
+                    RemovePreparation::Immediate(response) => response,
+                    RemovePreparation::Draining {
+                        device_id, force, ..
+                    } => self.complete_remove_device(request_id, device_id, force),
+                };
+                self.cache_mutating_outcome(key, Operation::RemoveDevice, fingerprint, &response);
+                response
             }
-            RequestBody::ListDevices(body) => self.handle_list_devices(request_id, body),
-            RequestBody::Health(_body) => self.handle_health(request_id),
+            RequestBody::ListDevices(body) => self.list_devices(request_id, body),
+            RequestBody::Health(_) => self.health(request_id),
         }
     }
 
@@ -218,258 +273,324 @@ impl ControlManager {
         self.insert_idempotency_outcome(idempotency_key, op, fingerprint, response);
     }
 
-    pub fn add_device(&mut self, request_id: String, body: AddDeviceRequest) -> ResponseEnvelope {
-        self.handle_add_device(request_id, body)
-    }
-
-    pub fn remove_device(
+    pub fn reserve_add_device(
         &mut self,
         request_id: String,
-        body: RemoveDeviceRequest,
-    ) -> ResponseEnvelope {
-        self.handle_remove_device(request_id, body)
-    }
-
-    pub fn list_devices(&self, request_id: String, body: ListDevicesRequest) -> ResponseEnvelope {
-        self.handle_list_devices(request_id, body)
-    }
-
-    pub fn health(&self, request_id: String) -> ResponseEnvelope {
-        self.handle_health(request_id)
-    }
-
-    fn handle_add_with_idempotency(
-        &mut self,
-        request_id: String,
-        idempotency_key: String,
-        fingerprint: Vec<u8>,
-        body: AddDeviceRequest,
-    ) -> ResponseEnvelope {
-        if let Some(cached) = self.lookup_cached_mutating_outcome(
-            request_id.clone(),
-            &idempotency_key,
-            Operation::AddDevice,
-            &fingerprint,
-        ) {
-            return cached;
-        }
-
-        let response = self.add_device(request_id, body);
-        self.cache_mutating_outcome(
-            idempotency_key,
-            Operation::AddDevice,
-            fingerprint,
-            &response,
-        );
-        response
-    }
-
-    fn handle_remove_with_idempotency(
-        &mut self,
-        request_id: String,
-        idempotency_key: String,
-        fingerprint: Vec<u8>,
-        body: RemoveDeviceRequest,
-    ) -> ResponseEnvelope {
-        if let Some(cached) = self.lookup_cached_mutating_outcome(
-            request_id.clone(),
-            &idempotency_key,
-            Operation::RemoveDevice,
-            &fingerprint,
-        ) {
-            return cached;
-        }
-
-        let response = self.remove_device(request_id, body);
-        self.cache_mutating_outcome(
-            idempotency_key,
-            Operation::RemoveDevice,
-            fingerprint,
-            &response,
-        );
-        response
-    }
-
-    fn insert_idempotency_outcome(
-        &mut self,
-        idempotency_key: String,
-        op: Operation,
-        fingerprint: Vec<u8>,
-        response: &ResponseEnvelope,
-    ) {
-        if self.idempotency_cache.len() >= self.idempotency_cache_limit {
-            if let Some(old_key) = self.idempotency_cache.keys().next().cloned() {
-                self.idempotency_cache.remove(&old_key);
-            }
-        }
-
-        self.idempotency_cache.insert(
-            idempotency_key,
-            CachedIdempotentOutcome::from_response(op, fingerprint, response),
-        );
-    }
-
-    fn handle_add_device(
-        &mut self,
-        request_id: String,
-        body: AddDeviceRequest,
-    ) -> ResponseEnvelope {
+        body: &AddDeviceRequest,
+    ) -> Result<AddDeviceReservation, ResponseEnvelope> {
         let volume_id = body.volume_id.trim().to_string();
         if volume_id.is_empty() {
-            return ResponseEnvelope::error(
+            return Err(ResponseEnvelope::error(
                 request_id,
                 ErrorCode::InvalidArgument,
                 "volume_id must be non-empty",
-            );
+            ));
         }
         if self.active_volume_to_device.contains_key(&volume_id) {
-            return ResponseEnvelope::error(
+            return Err(ResponseEnvelope::error(
                 request_id,
                 ErrorCode::AlreadyExists,
                 format!("volume_id '{}' is already attached", volume_id),
-            );
+            ));
         }
         if self.active_device_count() >= self.max_devices {
-            return ResponseEnvelope::error(
+            return Err(ResponseEnvelope::error(
                 request_id,
                 ErrorCode::Unavailable,
                 format!("max_devices={} reached", self.max_devices),
-            );
+            ));
         }
 
         let device_id = match body.ublk_device_id {
             Some(id) => {
                 if self.device_active(id) {
-                    return ResponseEnvelope::error(
+                    return Err(ResponseEnvelope::error(
                         request_id,
                         ErrorCode::AlreadyExists,
                         format!("device_id '{}' is already in use", id),
-                    );
+                    ));
                 }
                 id
             }
-            None => self.allocate_device_id(),
+            None => self.allocate_device_id(request_id.clone())?,
         };
 
         let device_path = format!("/dev/ublkb{device_id}");
-        let sequence = self.next_sequence();
         let record = DeviceRecord {
             device_id,
             volume_id: volume_id.clone(),
             device_path: device_path.clone(),
-            state: DeviceState::Serving,
+            state: DeviceState::Allocating,
             last_error: None,
-            updated_seq: sequence,
+            updated_seq: self.next_sequence(),
         };
         self.devices.insert(device_id, record);
         self.active_volume_to_device
             .insert(volume_id.clone(), device_id);
 
+        Ok(AddDeviceReservation {
+            device_id,
+            device_path,
+            volume_id,
+        })
+    }
+
+    pub fn mark_device_opening(&mut self, device_id: u32) -> Result<(), ResponseEnvelope> {
+        let Some(state) = self.devices.get(&device_id).map(|record| record.state) else {
+            return Err(ResponseEnvelope::error(
+                format!("add-device:{device_id}"),
+                ErrorCode::NotFound,
+                format!("device_id '{}' not found", device_id),
+            ));
+        };
+
+        if state == DeviceState::OpeningVolume {
+            return Ok(());
+        }
+        if state.is_terminal() {
+            return Err(ResponseEnvelope::error(
+                format!("add-device:{device_id}"),
+                ErrorCode::Busy,
+                format!(
+                    "device_id '{}' is in terminal state '{}'",
+                    device_id,
+                    state_name(state)
+                ),
+            ));
+        }
+
+        let updated_seq = self.next_sequence();
+        let Some(record) = self.devices.get_mut(&device_id) else {
+            return Err(ResponseEnvelope::error(
+                format!("add-device:{device_id}"),
+                ErrorCode::NotFound,
+                format!("device_id '{}' not found", device_id),
+            ));
+        };
+        record.state = DeviceState::OpeningVolume;
+        record.updated_seq = updated_seq;
+        Ok(())
+    }
+
+    pub fn finalize_add_success(&mut self, request_id: String, device_id: u32) -> ResponseEnvelope {
+        let updated_seq = self.next_sequence();
+        let Some(record) = self.devices.get_mut(&device_id) else {
+            return ResponseEnvelope::error(
+                request_id,
+                ErrorCode::Internal,
+                format!(
+                    "device_id '{}' missing before final add transition",
+                    device_id
+                ),
+            );
+        };
+
+        record.state = DeviceState::Serving;
+        record.last_error = None;
+        record.updated_seq = updated_seq;
         ResponseEnvelope::ok(
             request_id,
             AddDeviceResult {
-                device_id,
-                device_path,
-                volume_id,
-                state: DeviceState::Serving,
+                device_id: record.device_id,
+                device_path: record.device_path.clone(),
+                volume_id: record.volume_id.clone(),
+                state: record.state,
             },
         )
     }
 
-    fn handle_remove_device(
+    pub fn fail_add_device(
         &mut self,
         request_id: String,
-        body: RemoveDeviceRequest,
+        device_id: u32,
+        code: ErrorCode,
+        message: String,
     ) -> ResponseEnvelope {
+        let updated_seq = self.next_sequence();
+        let Some(record) = self.devices.get_mut(&device_id) else {
+            return ResponseEnvelope::error(
+                request_id,
+                ErrorCode::Internal,
+                format!(
+                    "device_id '{}' missing during add failure cleanup",
+                    device_id
+                ),
+            );
+        };
+
+        let volume_id = record.volume_id.clone();
+        record.state = DeviceState::Failed;
+        record.last_error = Some(message.clone());
+        record.updated_seq = updated_seq;
+        let _ = record;
+        self.active_volume_to_device.remove(&volume_id);
+        self.prune_terminal_history();
+        ResponseEnvelope::error(request_id, code, message)
+    }
+
+    pub fn prepare_remove_device(
+        &mut self,
+        request_id: String,
+        body: &RemoveDeviceRequest,
+    ) -> RemovePreparation {
         let volume_id = body
             .volume_id
             .as_ref()
             .map(|value| value.trim().to_string())
             .filter(|value| !value.is_empty());
-        let target_by_volume = volume_id
+
+        let target_by_active_volume = volume_id
             .as_deref()
-            .and_then(|id| self.active_volume_to_device.get(id).copied())
-            .or_else(|| {
-                volume_id
-                    .as_deref()
-                    .and_then(|id| self.find_recent_device_by_volume(id))
-            });
-        let target = match (body.device_id, target_by_volume) {
-            (Some(device_id), Some(by_volume)) if device_id != by_volume => {
-                return ResponseEnvelope::error(
+            .and_then(|id| self.active_volume_to_device.get(id).copied());
+        let target_by_recent_volume = volume_id
+            .as_deref()
+            .and_then(|id| self.find_recent_device_by_volume(id));
+
+        let target = match (body.device_id, target_by_active_volume) {
+            (Some(device_id), Some(active_id)) if device_id != active_id => {
+                return RemovePreparation::Immediate(ResponseEnvelope::error(
                     request_id,
                     ErrorCode::InvalidArgument,
-                    "device_id and volume_id refer to different devices",
-                );
+                    "device_id and volume_id refer to different active devices",
+                ));
             }
             (Some(device_id), _) => Some(device_id),
-            (None, by_volume) => by_volume,
-        };
-
-        let final_state = if body.force {
-            DeviceState::ForceDetached
-        } else {
-            DeviceState::Detached
+            (None, Some(active_id)) => Some(active_id),
+            (None, None) => target_by_recent_volume,
         };
 
         let Some(device_id) = target else {
-            return ResponseEnvelope::ok(
+            return RemovePreparation::Immediate(ResponseEnvelope::error(
+                request_id,
+                ErrorCode::NotFound,
+                "requested device was not found",
+            ));
+        };
+
+        let Some(state) = self.devices.get(&device_id).map(|record| record.state) else {
+            return RemovePreparation::Immediate(ResponseEnvelope::error(
+                request_id,
+                ErrorCode::NotFound,
+                format!("device_id '{}' not found", device_id),
+            ));
+        };
+
+        if state == DeviceState::Draining {
+            return RemovePreparation::Immediate(ResponseEnvelope::error(
+                request_id,
+                ErrorCode::Busy,
+                format!("device_id '{}' is already draining", device_id),
+            ));
+        }
+
+        if state.is_terminal() {
+            let volume_id = self
+                .devices
+                .get(&device_id)
+                .map(|record| record.volume_id.clone())
+                .unwrap_or_default();
+            return RemovePreparation::Immediate(ResponseEnvelope::ok(
                 request_id,
                 RemoveDeviceResult {
-                    device_id: body.device_id,
-                    volume_id,
-                    state: final_state,
+                    device_id: Some(device_id),
+                    volume_id: Some(volume_id),
+                    state,
                     noop: true,
                 },
+            ));
+        }
+
+        let updated_seq = self.next_sequence();
+        let Some(record) = self.devices.get_mut(&device_id) else {
+            return RemovePreparation::Immediate(ResponseEnvelope::error(
+                request_id,
+                ErrorCode::NotFound,
+                format!("device_id '{}' not found", device_id),
+            ));
+        };
+        let volume_id = record.volume_id.clone();
+        record.state = DeviceState::Draining;
+        record.updated_seq = updated_seq;
+        let _ = record;
+        self.active_volume_to_device.remove(&volume_id);
+
+        RemovePreparation::Draining {
+            device_id,
+            volume_id,
+            force: body.force,
+        }
+    }
+
+    pub fn complete_remove_device(
+        &mut self,
+        request_id: String,
+        device_id: u32,
+        force_detach: bool,
+    ) -> ResponseEnvelope {
+        let Some(state) = self.devices.get(&device_id).map(|record| record.state) else {
+            return ResponseEnvelope::error(
+                request_id,
+                ErrorCode::NotFound,
+                format!("device_id '{}' not found", device_id),
             );
         };
 
-        let draining_seq = self.next_sequence();
-        let final_seq = self.next_sequence();
-        let Some(record) = self.devices.get_mut(&device_id) else {
+        if state.is_terminal() {
+            let volume_id = self
+                .devices
+                .get(&device_id)
+                .map(|record| record.volume_id.clone())
+                .unwrap_or_default();
             return ResponseEnvelope::ok(
                 request_id,
                 RemoveDeviceResult {
                     device_id: Some(device_id),
-                    volume_id,
-                    state: final_state,
+                    volume_id: Some(volume_id),
+                    state,
                     noop: true,
                 },
             );
-        };
-
-        let mut noop = false;
-        if record.state.is_terminal() {
-            noop = true;
-        } else {
-            record.state = DeviceState::Draining;
-            record.updated_seq = draining_seq;
-            record.state = final_state;
-            record.updated_seq = final_seq;
-            self.active_volume_to_device.remove(&record.volume_id);
+        }
+        if state != DeviceState::Draining {
+            return ResponseEnvelope::error(
+                request_id,
+                ErrorCode::Busy,
+                format!(
+                    "device_id '{}' cannot complete remove from state '{}'",
+                    device_id,
+                    state_name(state)
+                ),
+            );
         }
 
-        let actual_volume_id = Some(record.volume_id.clone());
-        let result_state = record.state;
-        let result_noop = noop;
-        let _ = record;
-        self.prune_terminal_history();
-        ResponseEnvelope::ok(
+        let updated_seq = self.next_sequence();
+        let Some(record) = self.devices.get_mut(&device_id) else {
+            return ResponseEnvelope::error(
+                request_id,
+                ErrorCode::NotFound,
+                format!("device_id '{}' not found", device_id),
+            );
+        };
+        record.state = if force_detach {
+            DeviceState::ForceDetached
+        } else {
+            DeviceState::Detached
+        };
+        record.updated_seq = updated_seq;
+        let response = ResponseEnvelope::ok(
             request_id,
             RemoveDeviceResult {
                 device_id: Some(device_id),
-                volume_id: actual_volume_id,
-                state: result_state,
-                noop: result_noop,
+                volume_id: Some(record.volume_id.clone()),
+                state: record.state,
+                noop: false,
             },
-        )
+        );
+        self.prune_terminal_history();
+        response
     }
 
-    fn handle_list_devices(
-        &self,
-        request_id: String,
-        body: ListDevicesRequest,
-    ) -> ResponseEnvelope {
+    pub fn list_devices(&self, request_id: String, body: ListDevicesRequest) -> ResponseEnvelope {
         let state_filter = match body.state.as_deref() {
             Some(value) => match DeviceState::parse_filter(value) {
                 Some(state) => Some(state),
@@ -509,7 +630,7 @@ impl ControlManager {
         ResponseEnvelope::ok(request_id, ListDevicesResult { devices })
     }
 
-    fn handle_health(&self, request_id: String) -> ResponseEnvelope {
+    pub fn health(&self, request_id: String) -> ResponseEnvelope {
         let degraded_devices = self
             .devices
             .values()
@@ -538,6 +659,30 @@ impl ControlManager {
         )
     }
 
+    fn insert_idempotency_outcome(
+        &mut self,
+        idempotency_key: String,
+        op: Operation,
+        fingerprint: Vec<u8>,
+        response: &ResponseEnvelope,
+    ) {
+        if self.idempotency_cache.contains_key(&idempotency_key) {
+            self.idempotency_order.retain(|key| key != &idempotency_key);
+        }
+        self.idempotency_cache.insert(
+            idempotency_key.clone(),
+            CachedIdempotentOutcome::from_response(op, fingerprint, response),
+        );
+        self.idempotency_order.push_back(idempotency_key);
+
+        while self.idempotency_cache.len() > self.idempotency_cache_limit {
+            let Some(oldest_key) = self.idempotency_order.pop_front() else {
+                break;
+            };
+            self.idempotency_cache.remove(&oldest_key);
+        }
+    }
+
     fn active_device_count(&self) -> usize {
         self.devices
             .values()
@@ -551,12 +696,20 @@ impl ControlManager {
             .is_some_and(|record| !record.state.is_terminal())
     }
 
-    fn allocate_device_id(&mut self) -> u32 {
+    fn allocate_device_id(&mut self, request_id: String) -> Result<u32, ResponseEnvelope> {
+        let start = self.next_device_id;
         loop {
             let candidate = self.next_device_id;
-            self.next_device_id = self.next_device_id.saturating_add(1);
+            self.next_device_id = self.next_device_id.wrapping_add(1);
             if !self.device_active(candidate) {
-                return candidate;
+                return Ok(candidate);
+            }
+            if self.next_device_id == start {
+                return Err(ResponseEnvelope::error(
+                    request_id,
+                    ErrorCode::Unavailable,
+                    "no free device_id available",
+                ));
             }
         }
     }
@@ -596,6 +749,18 @@ impl ControlManager {
     fn next_sequence(&mut self) -> u64 {
         self.next_sequence = self.next_sequence.saturating_add(1);
         self.next_sequence
+    }
+}
+
+fn state_name(state: DeviceState) -> &'static str {
+    match state {
+        DeviceState::Allocating => "Allocating",
+        DeviceState::OpeningVolume => "OpeningVolume",
+        DeviceState::Serving => "Serving",
+        DeviceState::Draining => "Draining",
+        DeviceState::Detached => "Detached",
+        DeviceState::Failed => "Failed",
+        DeviceState::ForceDetached => "ForceDetached",
     }
 }
 
@@ -698,7 +863,7 @@ mod tests {
     }
 
     #[test]
-    fn remove_device_missing_target_is_success_noop() {
+    fn remove_device_missing_target_returns_not_found() {
         let mut manager = ControlManager::new(8, 128, 128);
         let request = parse_request(
             r#"{
@@ -711,12 +876,10 @@ mod tests {
         );
 
         let response = manager.handle_request(request);
-        assert!(response.ok);
-
-        let result: RemoveDeviceResult =
-            serde_json::from_value(response.result.expect("remove result should exist"))
-                .expect("result should deserialize");
-        assert!(result.noop);
-        assert_eq!(result.state, DeviceState::Detached);
+        assert!(!response.ok);
+        assert_eq!(
+            response.error.as_ref().map(|value| value.code.clone()),
+            Some(ErrorCode::NotFound)
+        );
     }
 }

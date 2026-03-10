@@ -4,6 +4,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 use temporal_nbd::session::{RetryConfig, VolumeSession, VolumeSessionConfig};
 use temporal_nbd::ublk::server::{run_serve, ServeConfig};
+use temporal_nbd::ublk::signal::wait_for_shutdown_signal;
 
 #[derive(Debug, Parser)]
 #[command(name = "temporal-ublk")]
@@ -211,8 +212,6 @@ async fn run_serve_mode(args: ServeArgs) -> anyhow::Result<()> {
         args.default_ublk_queues,
         args.default_ublk_queue_depth,
         args.default_ublk_timeout_secs,
-        args.graceful_drain_timeout_secs,
-        args.force_detach_timeout_secs,
         args.metrics_listen,
     );
 
@@ -235,29 +234,4 @@ async fn run_serve_mode(args: ServeArgs) -> anyhow::Result<()> {
     })
     .await
     .context("temporal-ublk serve failed")
-}
-
-async fn wait_for_shutdown_signal() -> anyhow::Result<&'static str> {
-    #[cfg(unix)]
-    {
-        use tokio::signal::unix::{signal, SignalKind};
-
-        let mut sigint =
-            signal(SignalKind::interrupt()).context("failed to install SIGINT handler")?;
-        let mut sigterm =
-            signal(SignalKind::terminate()).context("failed to install SIGTERM handler")?;
-
-        tokio::select! {
-            _ = sigint.recv() => Ok("SIGINT"),
-            _ = sigterm.recv() => Ok("SIGTERM"),
-        }
-    }
-
-    #[cfg(not(unix))]
-    {
-        tokio::signal::ctrl_c()
-            .await
-            .context("failed to wait for ctrl-c signal")?;
-        Ok("CTRL-C")
-    }
 }
