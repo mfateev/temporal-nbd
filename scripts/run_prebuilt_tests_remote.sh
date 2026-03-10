@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+default_temporal_repo="${TEMPORAL_REPO:-${repo_root}/../temporal}"
+
 usage() {
   cat <<'USAGE'
 Usage:
@@ -10,7 +13,7 @@ Build Rust test binaries locally, copy them over SSH, and execute them remotely
 without requiring Rust on the remote host.
 
 Options:
-  --remote USER@HOST          Remote SSH target (default: dev@192.168.64.13)
+  --remote USER@HOST          Remote SSH target (required; or set REMOTE_SSH_TARGET)
   --remote-dir PATH           Remote staging dir (default: /tmp/temporal-nbd-prebuilt-tests)
   --cargo-arg ARG             Extra argument appended to `cargo test` (repeatable)
   --include-unit              Include unit/bin test binaries (lib + bins)
@@ -19,7 +22,8 @@ Options:
   --no-auto-host-endpoint     Do not auto-set TEMPORAL_FRONTEND_ENDPOINT to this host
   --host-port PORT            Port for auto TEMPORAL_FRONTEND_ENDPOINT (default: 7233)
   --no-local-temporal         Do not start/stop Temporal server locally
-  --temporal-repo PATH        Temporal server repo path (default: /home/dev/temporal)
+  --temporal-repo PATH        Temporal server repo path (default: ../temporal relative to this repo,
+                              or TEMPORAL_REPO env var if set)
   --temporal-bin PATH         Temporal server binary path (default: /tmp/temporal-server-remote-e2e)
   --temporal-env NAME         Temporal config env (default: development-sqlite)
   --temporal-start-timeout N  Startup timeout in seconds (default: 30)
@@ -30,17 +34,19 @@ Options:
 
 Examples:
   scripts/run_prebuilt_tests_remote.sh \
+    --remote <user@host> \
     --cargo-arg --test --cargo-arg create_volume_smoke \
     --remote-env TEMPORAL_NAMESPACE=default
 
   scripts/run_prebuilt_tests_remote.sh \
+    --remote <user@host> \
     --run-ignored \
     --remote-env TEMPORAL_NAMESPACE=default \
     --remote-env TEMPORAL_VOLUME_ID=phaseb-remote-1
 USAGE
 }
 
-REMOTE="dev@192.168.64.13"
+REMOTE="${REMOTE_SSH_TARGET:-${REMOTE:-}}"
 REMOTE_DIR="/tmp/temporal-nbd-prebuilt-tests"
 RUN_IGNORED=0
 INCLUDE_UNIT=0
@@ -48,7 +54,7 @@ AUTO_HOST_ENDPOINT=1
 HOST_PORT="7233"
 COPY_ONLY=0
 MANAGE_LOCAL_TEMPORAL=1
-TEMPORAL_REPO="/home/dev/temporal"
+TEMPORAL_REPO="$default_temporal_repo"
 TEMPORAL_BIN="/tmp/temporal-server-remote-e2e"
 TEMPORAL_ENV="development-sqlite"
 TEMPORAL_START_TIMEOUT_SECS=30
@@ -147,6 +153,12 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+if [[ -z "$REMOTE" ]]; then
+  echo "remote SSH target is required (set --remote USER@HOST or REMOTE_SSH_TARGET)" >&2
+  usage >&2
+  exit 2
+fi
+
 for ((i=0; i<${#CARGO_ARGS[@]}; i++)); do
   if [[ "${CARGO_ARGS[$i]}" == "--test" ]] && (( i + 1 < ${#CARGO_ARGS[@]} )); then
     SELECTED_TESTS+=("${CARGO_ARGS[$((i + 1))]}")
@@ -165,7 +177,6 @@ require_cmd jq
 require_cmd ssh
 require_cmd tar
 
-repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$repo_root"
 
 if [[ -n "$LOCAL_LOG_DIR_OVERRIDE" ]]; then
@@ -289,15 +300,17 @@ build_temporal_server_bin_if_missing() {
     return 0
   fi
 
-  require_cmd go
   if [[ ! -d "$TEMPORAL_REPO" ]]; then
     echo "temporal repo does not exist: $TEMPORAL_REPO" >&2
+    echo "set --temporal-repo or TEMPORAL_REPO to a Temporal checkout" >&2
     exit 1
   fi
 
-  local go_bin="go"
-  if [[ -x /usr/local/go/bin/go ]]; then
-    go_bin=/usr/local/go/bin/go
+  local go_bin="${GO_BIN:-go}"
+  if ! command -v "$go_bin" >/dev/null 2>&1; then
+    echo "Go toolchain not found: $go_bin" >&2
+    echo "set GO_BIN or ensure go is available on PATH" >&2
+    exit 1
   fi
 
   echo "building temporal server binary at $TEMPORAL_BIN"

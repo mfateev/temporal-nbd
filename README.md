@@ -251,19 +251,20 @@ Use the helper script to build tests locally, copy executables to a remote host/
 
 ```bash
 scripts/run_prebuilt_tests_remote.sh \
-  --remote dev@192.168.64.13 \
+  --remote <user@host> \
   --cargo-arg --test --cargo-arg create_volume_smoke \
   --remote-env TEMPORAL_NAMESPACE=default
 
 # kernel-gated NBD mount test against Temporal server on this host
 scripts/run_prebuilt_tests_remote.sh \
-  --remote dev@192.168.64.13 \
+  --remote <user@host> \
   --cargo-arg --test --cargo-arg e2e_nbd_mount \
   --run-ignored \
   --remote-env TEMPORAL_NAMESPACE=default
 ```
 
 By default, the script sets remote `TEMPORAL_FRONTEND_ENDPOINT` to this host's IPv4 (`<this-host-ip>:7233`) so remote tests can target a Temporal server running here. Disable that behavior with `--no-auto-host-endpoint`.
+Remote SSH target must be provided explicitly via `--remote` or `REMOTE_SSH_TARGET`.
 
 ## Troubleshooting
 

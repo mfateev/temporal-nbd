@@ -114,13 +114,7 @@ fn build_temporal_server(temporal_repo: &Path, output_bin: &Path) -> anyhow::Res
 }
 
 fn resolve_go_bin() -> String {
-    env::var("GO_BIN").unwrap_or_else(|_| {
-        if Path::new("/usr/local/go/bin/go").exists() {
-            "/usr/local/go/bin/go".to_string()
-        } else {
-            "go".to_string()
-        }
-    })
+    env::var("GO_BIN").unwrap_or_else(|_| "go".to_string())
 }
 
 fn temporal_server_build_command(go_bin: &str, temporal_repo: &Path, output_bin: &Path) -> Command {
