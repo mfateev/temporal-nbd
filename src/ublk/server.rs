@@ -5,12 +5,17 @@ use crate::control::protocol::{
 use crate::errors::TransportError;
 use crate::session::{RetryConfig, VolumeSession, VolumeSessionConfig};
 use crate::ublk::manager::{ControlManager, RemovePreparation};
+use crate::ublk::metrics::UblkMetrics;
+use crate::ublk::runtime::{self, DeviceStartConfig, RuntimeErrorKind};
 use crate::ublk::signal::wait_for_shutdown_signal;
 use anyhow::Context;
+use serde_json::Value;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpListener;
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{oneshot, Mutex};
 use tokio::task::{JoinHandle, JoinSet};
@@ -19,10 +24,15 @@ use tokio_util::sync::CancellationToken;
 
 #[derive(Clone, Debug)]
 pub struct ServeConfig {
+    pub ublk_control_device: PathBuf,
     pub control_socket: PathBuf,
     pub max_devices: usize,
     pub terminal_history_limit: usize,
     pub idempotency_cache_limit: usize,
+    pub default_ublk_queues: u16,
+    pub default_ublk_queue_depth: u16,
+    pub default_ublk_timeout: Duration,
+    pub metrics_listen: Option<String>,
     pub ready_file: Option<PathBuf>,
     pub frontend_endpoint: String,
     pub namespace: String,
@@ -39,10 +49,15 @@ pub struct ServeConfig {
 impl Default for ServeConfig {
     fn default() -> Self {
         Self {
+            ublk_control_device: PathBuf::from(runtime::DEFAULT_CONTROL_DEVICE),
             control_socket: PathBuf::from("/tmp/temporal-ublk.sock"),
             max_devices: 64,
             terminal_history_limit: 256,
             idempotency_cache_limit: 2048,
+            default_ublk_queues: 1,
+            default_ublk_queue_depth: 128,
+            default_ublk_timeout: Duration::from_secs(30),
+            metrics_listen: None,
             ready_file: None,
             frontend_endpoint: "127.0.0.1:7233".to_string(),
             namespace: "default".to_string(),
@@ -62,6 +77,10 @@ impl Default for ServeConfig {
 struct RuntimeConfig {
     frontend_endpoint: String,
     namespace: String,
+    ublk_control_device: PathBuf,
+    default_ublk_queues: u16,
+    default_ublk_queue_depth: u16,
+    default_ublk_timeout: Duration,
     connect_timeout: Duration,
     rpc_timeout: Duration,
     retry_max_attempts: usize,
@@ -80,6 +99,13 @@ struct RuntimeDevice {
 
 type RuntimeDevices = Arc<Mutex<HashMap<u32, RuntimeDevice>>>;
 
+#[derive(Clone, Copy, Debug)]
+struct DeviceRuntimeSettings {
+    queues: u16,
+    queue_depth: u16,
+    timeout: Duration,
+}
+
 pub async fn run_serve(config: ServeConfig) -> anyhow::Result<()> {
     #[cfg(not(unix))]
     {
@@ -89,6 +115,11 @@ pub async fn run_serve(config: ServeConfig) -> anyhow::Result<()> {
 
     #[cfg(unix)]
     {
+        runtime::preflight(&config.ublk_control_device)
+            .map_err(|err| anyhow::anyhow!(err.message))?;
+        runtime::validate_queue_model(config.default_ublk_queues, config.default_ublk_queue_depth)
+            .map_err(|err| anyhow::anyhow!(err.message))?;
+
         prepare_socket_path(&config.control_socket)?;
 
         let listener = UnixListener::bind(&config.control_socket).with_context(|| {
@@ -116,10 +147,15 @@ pub async fn run_serve(config: ServeConfig) -> anyhow::Result<()> {
             config.terminal_history_limit,
             config.idempotency_cache_limit,
         )));
+        let metrics = Arc::new(UblkMetrics::default());
         let runtime_devices: RuntimeDevices = Arc::new(Mutex::new(HashMap::new()));
         let runtime_config = Arc::new(RuntimeConfig {
             frontend_endpoint: config.frontend_endpoint,
             namespace: config.namespace,
+            ublk_control_device: config.ublk_control_device,
+            default_ublk_queues: config.default_ublk_queues,
+            default_ublk_queue_depth: config.default_ublk_queue_depth,
+            default_ublk_timeout: config.default_ublk_timeout,
             connect_timeout: config.connect_timeout,
             rpc_timeout: config.rpc_timeout,
             retry_max_attempts: config.retry_max_attempts,
@@ -130,8 +166,22 @@ pub async fn run_serve(config: ServeConfig) -> anyhow::Result<()> {
             force_detach_timeout: config.force_detach_timeout,
         });
         let mutating_serial = Arc::new(Mutex::new(()));
+        let metrics_shutdown = CancellationToken::new();
 
         let mut tasks = JoinSet::new();
+        if let Some(metrics_addr) = config.metrics_listen.clone() {
+            let metrics = metrics.clone();
+            let shutdown = metrics_shutdown.child_token();
+            tasks.spawn(async move {
+                if let Err(err) = run_metrics_server(metrics_addr, metrics, shutdown).await {
+                    log_event(
+                        "ERROR",
+                        "metrics_server_error",
+                        &[("error", err.to_string())],
+                    );
+                }
+            });
+        }
         let shutdown_signal = wait_for_shutdown_signal();
         tokio::pin!(shutdown_signal);
 
@@ -146,6 +196,7 @@ pub async fn run_serve(config: ServeConfig) -> anyhow::Result<()> {
                         }
                     };
                     let manager = manager.clone();
+                    let metrics = metrics.clone();
                     let runtime_devices = runtime_devices.clone();
                     let runtime_config = runtime_config.clone();
                     let mutating_serial = mutating_serial.clone();
@@ -153,6 +204,7 @@ pub async fn run_serve(config: ServeConfig) -> anyhow::Result<()> {
                         if let Err(err) = handle_connection(
                             stream,
                             manager,
+                            metrics,
                             runtime_devices,
                             runtime_config,
                             mutating_serial,
@@ -171,13 +223,14 @@ pub async fn run_serve(config: ServeConfig) -> anyhow::Result<()> {
             }
         }
 
+        metrics_shutdown.cancel();
         while let Some(result) = tasks.join_next().await {
             if let Err(err) = result {
                 log_event("ERROR", "control_join_error", &[("error", err.to_string())]);
             }
         }
 
-        shutdown_runtime_devices(&runtime_devices, &runtime_config).await;
+        shutdown_runtime_devices(&runtime_devices, &runtime_config, &metrics).await;
         drop(listener);
         cleanup_path_if_exists(&config.control_socket)?;
         if let Some(path) = &config.ready_file {
@@ -190,6 +243,7 @@ pub async fn run_serve(config: ServeConfig) -> anyhow::Result<()> {
 async fn handle_connection(
     mut stream: UnixStream,
     manager: Arc<Mutex<ControlManager>>,
+    metrics: Arc<UblkMetrics>,
     runtime_devices: RuntimeDevices,
     runtime_config: Arc<RuntimeConfig>,
     mutating_serial: Arc<Mutex<()>>,
@@ -208,6 +262,7 @@ async fn handle_connection(
                 process_request(
                     request,
                     manager.clone(),
+                    metrics.clone(),
                     runtime_devices.clone(),
                     runtime_config.clone(),
                     mutating_serial.clone(),
@@ -228,6 +283,7 @@ async fn handle_connection(
 async fn process_request(
     request: ControlRequest,
     manager: Arc<Mutex<ControlManager>>,
+    metrics: Arc<UblkMetrics>,
     runtime_devices: RuntimeDevices,
     runtime_config: Arc<RuntimeConfig>,
     mutating_serial: Arc<Mutex<()>>,
@@ -244,6 +300,7 @@ async fn process_request(
                 fingerprint,
                 body,
                 manager,
+                metrics,
                 runtime_devices,
                 runtime_config,
                 mutating_serial,
@@ -257,6 +314,7 @@ async fn process_request(
                 fingerprint,
                 body,
                 manager,
+                metrics,
                 runtime_devices,
                 runtime_config,
                 mutating_serial,
@@ -280,13 +338,14 @@ async fn process_add_device(
     fingerprint: Vec<u8>,
     body: AddDeviceRequest,
     manager: Arc<Mutex<ControlManager>>,
+    metrics: Arc<UblkMetrics>,
     runtime_devices: RuntimeDevices,
     runtime_config: Arc<RuntimeConfig>,
     mutating_serial: Arc<Mutex<()>>,
 ) -> ResponseEnvelope {
     let _serial_guard = mutating_serial.lock().await;
 
-    let reservation = {
+    let (reservation, runtime_settings) = {
         let mut guard = manager.lock().await;
         if let Some(cached) = guard.lookup_cached_mutating_outcome(
             request_id.clone(),
@@ -296,6 +355,20 @@ async fn process_add_device(
         ) {
             return cached;
         }
+
+        let runtime_settings =
+            match resolve_runtime_settings(&request_id, &body, runtime_config.as_ref()) {
+                Ok(settings) => settings,
+                Err(response) => {
+                    guard.cache_mutating_outcome(
+                        idempotency_key,
+                        Operation::AddDevice,
+                        fingerprint,
+                        &response,
+                    );
+                    return response;
+                }
+            };
 
         match guard.reserve_add_device(request_id.clone(), &body) {
             Ok(reservation) => {
@@ -308,7 +381,7 @@ async fn process_add_device(
                     );
                     return response;
                 }
-                reservation
+                (reservation, runtime_settings)
             }
             Err(response) => {
                 guard.cache_mutating_outcome(
@@ -322,26 +395,33 @@ async fn process_add_device(
         }
     };
 
-    let runtime_device =
-        match start_runtime_task(reservation.volume_id.clone(), runtime_config.clone()).await {
-            Ok(device) => device,
-            Err(err) => {
-                let mut guard = manager.lock().await;
-                let response = guard.fail_add_device(
-                    request_id.clone(),
-                    reservation.device_id,
-                    err.code,
-                    err.message,
-                );
-                guard.cache_mutating_outcome(
-                    idempotency_key,
-                    Operation::AddDevice,
-                    fingerprint,
-                    &response,
-                );
-                return response;
-            }
-        };
+    let runtime_device = match start_runtime_task(
+        reservation.device_id,
+        reservation.volume_id.clone(),
+        runtime_settings,
+        runtime_config.clone(),
+    )
+    .await
+    {
+        Ok(device) => device,
+        Err(err) => {
+            let mut guard = manager.lock().await;
+            let response = guard.fail_add_device(
+                request_id.clone(),
+                reservation.device_id,
+                err.code,
+                err.message,
+            );
+            guard.cache_mutating_outcome(
+                idempotency_key.clone(),
+                Operation::AddDevice,
+                fingerprint,
+                &response,
+            );
+            metrics.record_add_result(false);
+            return response;
+        }
+    };
 
     runtime_devices
         .lock()
@@ -356,9 +436,11 @@ async fn process_add_device(
             &runtime_devices,
             &runtime_config,
             true,
+            &metrics,
         )
         .await;
     }
+    metrics.record_add_result(response.ok);
     guard.cache_mutating_outcome(
         idempotency_key,
         Operation::AddDevice,
@@ -374,6 +456,7 @@ async fn process_remove_device(
     fingerprint: Vec<u8>,
     body: RemoveDeviceRequest,
     manager: Arc<Mutex<ControlManager>>,
+    metrics: Arc<UblkMetrics>,
     runtime_devices: RuntimeDevices,
     runtime_config: Arc<RuntimeConfig>,
     mutating_serial: Arc<Mutex<()>>,
@@ -402,6 +485,7 @@ async fn process_remove_device(
                 fingerprint,
                 &response,
             );
+            metrics.record_remove_result(response.ok, response_detached_device(&response));
             return response;
         }
         RemovePreparation::Draining {
@@ -411,14 +495,21 @@ async fn process_remove_device(
         } => (device_id, force),
     };
 
-    let timed_out =
-        stop_runtime_device(device_id, &runtime_devices, &runtime_config, force_detach).await;
+    let timed_out = stop_runtime_device(
+        device_id,
+        &runtime_devices,
+        &runtime_config,
+        force_detach,
+        &metrics,
+    )
+    .await;
     if timed_out {
         force_detach = true;
     }
 
     let mut guard = manager.lock().await;
     let response = guard.complete_remove_device(request_id, device_id, force_detach);
+    metrics.record_remove_result(response.ok, response_detached_device(&response));
     guard.cache_mutating_outcome(
         idempotency_key,
         Operation::RemoveDevice,
@@ -434,7 +525,9 @@ struct RuntimeStartError {
 }
 
 async fn start_runtime_task(
+    expected_device_id: u32,
     volume_id: String,
+    settings: DeviceRuntimeSettings,
     config: Arc<RuntimeConfig>,
 ) -> Result<RuntimeDevice, RuntimeStartError> {
     let shutdown = CancellationToken::new();
@@ -442,7 +535,15 @@ async fn start_runtime_task(
     let (ready_tx, ready_rx) = oneshot::channel();
     let task_config = config.clone();
     let task = tokio::spawn(async move {
-        run_runtime_device_task(volume_id, task_config, task_shutdown, ready_tx).await;
+        run_runtime_device_task(
+            expected_device_id,
+            volume_id,
+            settings,
+            task_config,
+            task_shutdown,
+            ready_tx,
+        )
+        .await;
     });
 
     match ready_rx.await {
@@ -462,7 +563,9 @@ async fn start_runtime_task(
 }
 
 async fn run_runtime_device_task(
+    expected_device_id: u32,
     volume_id: String,
+    settings: DeviceRuntimeSettings,
     config: Arc<RuntimeConfig>,
     shutdown: CancellationToken,
     ready_tx: oneshot::Sender<Result<(), RuntimeStartError>>,
@@ -476,10 +579,74 @@ async fn run_runtime_device_task(
             return;
         }
     };
+    let geometry = session.geometry();
+    let runtime = match runtime::start_device(DeviceStartConfig {
+        control_device: config.ublk_control_device.clone(),
+        volume_id: volume_id.clone(),
+        requested_device_id: Some(expected_device_id),
+        size_bytes: geometry.size_bytes,
+        block_size_bytes: geometry.block_size_bytes,
+        queues: settings.queues,
+        queue_depth: settings.queue_depth,
+    })
+    .await
+    {
+        Ok(runtime) => runtime,
+        Err(err) => {
+            let _ = ready_tx.send(Err(map_runtime_error(&volume_id, err)));
+            return;
+        }
+    };
+
+    if runtime.device_id != expected_device_id {
+        let _ = ready_tx.send(Err(RuntimeStartError {
+            code: ErrorCode::Internal,
+            message: format!(
+                "runtime started unexpected device_id '{}' for volume '{}' (expected '{}')",
+                runtime.device_id, volume_id, expected_device_id
+            ),
+        }));
+        runtime.request_stop();
+        let _ = runtime.wait().await;
+        return;
+    }
 
     let _ = ready_tx.send(Ok(()));
     let _session = session;
     shutdown.cancelled().await;
+    runtime.request_stop();
+    match timeout(settings.timeout, runtime.wait()).await {
+        Ok(Ok(())) => {}
+        Ok(Err(err)) => log_event(
+            "ERROR",
+            "runtime_shutdown_failed",
+            &[
+                ("device_id", expected_device_id.to_string()),
+                ("volume_id", volume_id),
+                ("error", err.to_string()),
+            ],
+        ),
+        Err(_) => {
+            log_event(
+                "WARN",
+                "runtime_wait_timeout",
+                &[
+                    ("device_id", expected_device_id.to_string()),
+                    ("volume_id", volume_id),
+                ],
+            );
+            if let Err(err) = runtime::force_detach_device(expected_device_id).await {
+                log_event(
+                    "ERROR",
+                    "runtime_wait_force_detach_failed",
+                    &[
+                        ("device_id", expected_device_id.to_string()),
+                        ("error", err.to_string()),
+                    ],
+                );
+            }
+        }
+    }
 }
 
 fn build_session_config(config: &RuntimeConfig, volume_id: &str) -> VolumeSessionConfig {
@@ -517,11 +684,27 @@ fn map_open_error(volume_id: &str, error: TransportError) -> RuntimeStartError {
     }
 }
 
+fn map_runtime_error(volume_id: &str, error: runtime::RuntimeError) -> RuntimeStartError {
+    let code = match error.kind {
+        RuntimeErrorKind::InvalidArgument => ErrorCode::InvalidArgument,
+        RuntimeErrorKind::Unavailable => ErrorCode::Unavailable,
+        RuntimeErrorKind::Internal => ErrorCode::Internal,
+    };
+    RuntimeStartError {
+        code,
+        message: format!(
+            "failed to start ublk runtime for volume '{}': {}",
+            volume_id, error
+        ),
+    }
+}
+
 async fn stop_runtime_device(
     device_id: u32,
     runtime_devices: &RuntimeDevices,
     runtime_config: &RuntimeConfig,
     force: bool,
+    metrics: &Arc<UblkMetrics>,
 ) -> bool {
     let runtime = runtime_devices.lock().await.remove(&device_id);
     let Some(runtime) = runtime else {
@@ -549,6 +732,7 @@ async fn stop_runtime_device(
             false
         }
         Err(_) => {
+            metrics.record_drain_timeout();
             log_event(
                 "WARN",
                 "runtime_task_stop_timeout",
@@ -557,6 +741,17 @@ async fn stop_runtime_device(
                     ("force", force.to_string()),
                 ],
             );
+            match runtime::force_detach_device(device_id).await {
+                Ok(()) => metrics.record_force_detach(),
+                Err(err) => log_event(
+                    "ERROR",
+                    "runtime_force_detach_failed",
+                    &[
+                        ("device_id", device_id.to_string()),
+                        ("error", err.to_string()),
+                    ],
+                ),
+            }
             true
         }
     }
@@ -565,6 +760,7 @@ async fn stop_runtime_device(
 async fn shutdown_runtime_devices(
     runtime_devices: &RuntimeDevices,
     runtime_config: &RuntimeConfig,
+    metrics: &Arc<UblkMetrics>,
 ) {
     let devices = std::mem::take(&mut *runtime_devices.lock().await);
     for (device_id, runtime) in devices {
@@ -573,13 +769,176 @@ async fn shutdown_runtime_devices(
             .await
             .is_err()
         {
+            metrics.record_drain_timeout();
             log_event(
                 "WARN",
                 "runtime_shutdown_timeout",
                 &[("device_id", device_id.to_string())],
             );
+            match runtime::force_detach_device(device_id).await {
+                Ok(()) => metrics.record_force_detach(),
+                Err(err) => log_event(
+                    "ERROR",
+                    "runtime_shutdown_force_detach_failed",
+                    &[
+                        ("device_id", device_id.to_string()),
+                        ("error", err.to_string()),
+                    ],
+                ),
+            }
         }
     }
+}
+
+fn resolve_runtime_settings(
+    request_id: &str,
+    body: &AddDeviceRequest,
+    config: &RuntimeConfig,
+) -> Result<DeviceRuntimeSettings, ResponseEnvelope> {
+    let mut queues = config.default_ublk_queues;
+    let mut queue_depth = config.default_ublk_queue_depth;
+    let mut timeout = config.default_ublk_timeout;
+
+    if let Some(overrides) = &body.overrides {
+        let Some(map) = overrides.as_object() else {
+            return Err(ResponseEnvelope::error(
+                request_id.to_string(),
+                ErrorCode::InvalidArgument,
+                "AddDevice body.overrides must be a JSON object",
+            ));
+        };
+
+        if let Some(value) = map.get("ublk_queues") {
+            let parsed = parse_u64_override(request_id, value, "overrides.ublk_queues")?;
+            queues = u16::try_from(parsed).map_err(|_| {
+                ResponseEnvelope::error(
+                    request_id.to_string(),
+                    ErrorCode::InvalidArgument,
+                    "overrides.ublk_queues must fit in u16",
+                )
+            })?;
+        }
+
+        if let Some(value) = map.get("ublk_queue_depth") {
+            let parsed = parse_u64_override(request_id, value, "overrides.ublk_queue_depth")?;
+            queue_depth = u16::try_from(parsed).map_err(|_| {
+                ResponseEnvelope::error(
+                    request_id.to_string(),
+                    ErrorCode::InvalidArgument,
+                    "overrides.ublk_queue_depth must fit in u16",
+                )
+            })?;
+        }
+
+        if let Some(value) = map.get("ublk_timeout_secs") {
+            let parsed = parse_u64_override(request_id, value, "overrides.ublk_timeout_secs")?;
+            timeout = Duration::from_secs(parsed);
+        }
+    }
+
+    runtime::validate_queue_model(queues, queue_depth).map_err(|err| {
+        ResponseEnvelope::error(
+            request_id.to_string(),
+            ErrorCode::InvalidArgument,
+            format!("invalid ublk runtime settings: {}", err.message),
+        )
+    })?;
+
+    Ok(DeviceRuntimeSettings {
+        queues,
+        queue_depth,
+        timeout,
+    })
+}
+
+fn parse_u64_override(
+    request_id: &str,
+    value: &Value,
+    field_name: &str,
+) -> Result<u64, ResponseEnvelope> {
+    value.as_u64().ok_or_else(|| {
+        ResponseEnvelope::error(
+            request_id.to_string(),
+            ErrorCode::InvalidArgument,
+            format!("{field_name} must be a positive integer"),
+        )
+    })
+}
+
+fn response_detached_device(response: &ResponseEnvelope) -> bool {
+    if !response.ok {
+        return false;
+    }
+
+    response
+        .result
+        .as_ref()
+        .and_then(|value| value.get("noop"))
+        .and_then(Value::as_bool)
+        .map(|noop| !noop)
+        .unwrap_or(false)
+}
+
+async fn run_metrics_server(
+    listen: String,
+    metrics: Arc<UblkMetrics>,
+    shutdown: CancellationToken,
+) -> anyhow::Result<()> {
+    let listener = TcpListener::bind(&listen)
+        .await
+        .with_context(|| format!("failed to bind metrics listener on {listen}"))?;
+    log_event("INFO", "metrics_listening", &[("listen", listen)]);
+
+    loop {
+        tokio::select! {
+            _ = shutdown.cancelled() => return Ok(()),
+            accept = listener.accept() => {
+                let (mut stream, _) = accept.context("metrics listener accept failed")?;
+                let metrics = metrics.clone();
+                tokio::spawn(async move {
+                    if let Err(err) = handle_metrics_connection(&mut stream, metrics).await {
+                        log_event("WARN", "metrics_connection_failed", &[("error", err.to_string())]);
+                    }
+                });
+            }
+        }
+    }
+}
+
+async fn handle_metrics_connection(
+    stream: &mut tokio::net::TcpStream,
+    metrics: Arc<UblkMetrics>,
+) -> anyhow::Result<()> {
+    let mut buf = [0_u8; 1024];
+    let read = timeout(Duration::from_secs(2), stream.read(&mut buf))
+        .await
+        .context("metrics request read timeout")?
+        .context("metrics request read failed")?;
+    if read == 0 {
+        return Ok(());
+    }
+
+    let request = String::from_utf8_lossy(&buf[..read]);
+    let first_line = request.lines().next().unwrap_or_default();
+    let path = first_line.split_whitespace().nth(1).unwrap_or("/");
+    let (content_type, body) = if path == "/ready" {
+        ("text/plain; charset=utf-8", "ready\n".to_string())
+    } else {
+        (
+            "text/plain; version=0.0.4; charset=utf-8",
+            metrics.render_prometheus(),
+        )
+    };
+
+    let response = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        body.len(),
+        body
+    );
+    stream
+        .write_all(response.as_bytes())
+        .await
+        .context("metrics response write failed")
 }
 
 #[cfg(unix)]
@@ -647,6 +1006,10 @@ mod tests {
         Arc::new(RuntimeConfig {
             frontend_endpoint: "127.0.0.1:1".to_string(),
             namespace: "default".to_string(),
+            ublk_control_device: PathBuf::from(runtime::DEFAULT_CONTROL_DEVICE),
+            default_ublk_queues: 1,
+            default_ublk_queue_depth: 128,
+            default_ublk_timeout: Duration::from_millis(20),
             connect_timeout: Duration::from_millis(20),
             rpc_timeout: Duration::from_millis(20),
             retry_max_attempts: 1,
@@ -663,10 +1026,12 @@ mod tests {
         let manager = Arc::new(Mutex::new(ControlManager::new(8, 128, 128)));
         let runtime_devices: RuntimeDevices = Arc::new(Mutex::new(HashMap::new()));
         let mutating_serial = Arc::new(Mutex::new(()));
+        let metrics = Arc::new(UblkMetrics::default());
         let (mut client, server) = UnixStream::pair().expect("pair should work");
         let task = tokio::spawn(handle_connection(
             server,
             manager.clone(),
+            metrics,
             runtime_devices.clone(),
             test_runtime_config(),
             mutating_serial,
@@ -701,10 +1066,12 @@ mod tests {
         let manager = Arc::new(Mutex::new(ControlManager::new(8, 128, 128)));
         let runtime_devices: RuntimeDevices = Arc::new(Mutex::new(HashMap::new()));
         let mutating_serial = Arc::new(Mutex::new(()));
+        let metrics = Arc::new(UblkMetrics::default());
         let (mut client, server) = UnixStream::pair().expect("pair should work");
         let task = tokio::spawn(handle_connection(
             server,
             manager.clone(),
+            metrics,
             runtime_devices.clone(),
             test_runtime_config(),
             mutating_serial,
@@ -738,6 +1105,88 @@ mod tests {
         assert!(!first.ok);
         assert!(!second.ok);
         assert_eq!(first.error, second.error);
+
+        drop(client);
+        task.await
+            .expect("connection task should join")
+            .expect("ok");
+    }
+
+    #[tokio::test]
+    async fn add_device_rejects_non_object_overrides() {
+        let manager = Arc::new(Mutex::new(ControlManager::new(8, 128, 128)));
+        let runtime_devices: RuntimeDevices = Arc::new(Mutex::new(HashMap::new()));
+        let mutating_serial = Arc::new(Mutex::new(()));
+        let metrics = Arc::new(UblkMetrics::default());
+        let (mut client, server) = UnixStream::pair().expect("pair should work");
+        let task = tokio::spawn(handle_connection(
+            server,
+            manager,
+            metrics,
+            runtime_devices,
+            test_runtime_config(),
+            mutating_serial,
+        ));
+
+        let response = request(
+            &mut client,
+            json!({
+                "version":"v1",
+                "request_id":"req-1",
+                "idempotency_key":"key-1",
+                "op":"AddDevice",
+                "body":{"volume_id":"vol-a","overrides":[]}
+            }),
+        )
+        .await
+        .expect("response should parse");
+
+        assert!(!response.ok);
+        assert_eq!(
+            response.error.as_ref().map(|value| &value.code),
+            Some(&ErrorCode::InvalidArgument)
+        );
+
+        drop(client);
+        task.await
+            .expect("connection task should join")
+            .expect("ok");
+    }
+
+    #[tokio::test]
+    async fn add_device_rejects_invalid_queue_override() {
+        let manager = Arc::new(Mutex::new(ControlManager::new(8, 128, 128)));
+        let runtime_devices: RuntimeDevices = Arc::new(Mutex::new(HashMap::new()));
+        let mutating_serial = Arc::new(Mutex::new(()));
+        let metrics = Arc::new(UblkMetrics::default());
+        let (mut client, server) = UnixStream::pair().expect("pair should work");
+        let task = tokio::spawn(handle_connection(
+            server,
+            manager,
+            metrics,
+            runtime_devices,
+            test_runtime_config(),
+            mutating_serial,
+        ));
+
+        let response = request(
+            &mut client,
+            json!({
+                "version":"v1",
+                "request_id":"req-1",
+                "idempotency_key":"key-1",
+                "op":"AddDevice",
+                "body":{"volume_id":"vol-a","overrides":{"ublk_queues":0}}
+            }),
+        )
+        .await
+        .expect("response should parse");
+
+        assert!(!response.ok);
+        assert_eq!(
+            response.error.as_ref().map(|value| &value.code),
+            Some(&ErrorCode::InvalidArgument)
+        );
 
         drop(client);
         task.await

@@ -10,8 +10,8 @@ See also:
 
 - `create-volume`: Provision one Temporal volume.
 - `attach`: Attach one Temporal volume to one Linux NBD device and serve `READ`, `WRITE`, `FLUSH`, `DISC`.
-- `temporal-ublk attach` (Phase 1 foundation): validates UBLK control-device access, opens the Temporal volume, and keeps a lifecycle process alive until shutdown signal.
-- `temporal-ublk serve` (Phase 1 foundation): local Unix-socket control-plane manager implementing `AddDevice`/`RemoveDevice`/`ListDevices`/`Health` contracts with idempotency and per-device runtime tasks that open volumes.
+- `temporal-ublk attach` (Phase 1): runs single-volume ublk lifecycle supervision (preflight, volume open, runtime start/stop orchestration) and waits for shutdown signals.
+- `temporal-ublk serve` (Phase 1): Unix-socket control-plane manager implementing `AddDevice`/`RemoveDevice`/`ListDevices`/`Health` with idempotency and per-device lifecycle runtime supervision.
 - `create_volume_smoke` test: workflowservice Create/Open/Write/Read contract validation lives in `tests/create_volume_smoke.rs` (validation, not provisioning flow).
 
 ## Prereqs
@@ -123,7 +123,7 @@ If you built locally with Cargo, the binary is usually at:
 - `target/debug/temporal-ublk`
 - `target/release/temporal-ublk`
 
-## UBLK Foundation
+## UBLK Phase 1
 
 Run `serve`:
 
@@ -131,6 +131,7 @@ Run `serve`:
 cargo run --bin temporal-ublk -- serve \
   --frontend-endpoint 127.0.0.1:7233 \
   --namespace default \
+  --ublk-control-device /dev/ublk-control \
   --control-socket /tmp/temporal-ublk.sock \
   --max-devices 64
 ```

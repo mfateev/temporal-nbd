@@ -3,12 +3,14 @@ use clap::{Args, Parser, Subcommand};
 use std::path::PathBuf;
 use std::time::Duration;
 use temporal_nbd::session::{RetryConfig, VolumeSession, VolumeSessionConfig};
+use temporal_nbd::ublk::runtime::{self, DeviceStartConfig};
 use temporal_nbd::ublk::server::{run_serve, ServeConfig};
 use temporal_nbd::ublk::signal::wait_for_shutdown_signal;
+use tokio::time::timeout;
 
 #[derive(Debug, Parser)]
 #[command(name = "temporal-ublk")]
-#[command(about = "Temporal UBLK manager (Phase 1 foundation)")]
+#[command(about = "Temporal UBLK manager (Phase 1)")]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -16,7 +18,7 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Attach one volume (Phase 1 foundation: preflight + OpenVolume + lifecycle wait)
+    /// Attach one volume with Phase 1 ublk lifecycle supervision
     Attach(AttachArgs),
 
     /// Run multi-device control-plane manager on a Unix socket
@@ -87,6 +89,13 @@ struct ServeArgs {
 
     #[arg(long, env = "TEMPORAL_NAMESPACE")]
     namespace: String,
+
+    #[arg(
+        long,
+        env = "TEMPORAL_UBLK_CONTROL_DEVICE",
+        default_value = "/dev/ublk-control"
+    )]
+    ublk_control_device: PathBuf,
 
     #[arg(
         long,
@@ -171,12 +180,9 @@ async fn main() -> anyhow::Result<()> {
 }
 
 async fn run_attach(args: AttachArgs) -> anyhow::Result<()> {
-    if !args.ublk_control_device.exists() {
-        anyhow::bail!(
-            "UBLK control device {} does not exist",
-            args.ublk_control_device.display()
-        );
-    }
+    runtime::preflight(&args.ublk_control_device).map_err(|err| anyhow::anyhow!(err.message))?;
+    runtime::validate_queue_model(args.ublk_queues, args.ublk_queue_depth)
+        .map_err(|err| anyhow::anyhow!(err.message))?;
 
     let session = VolumeSession::connect_and_open(VolumeSessionConfig {
         frontend_endpoint: args.frontend_endpoint.clone(),
@@ -194,34 +200,52 @@ async fn run_attach(args: AttachArgs) -> anyhow::Result<()> {
     .await
     .map_err(|err| anyhow::anyhow!("failed to open volume '{}': {}", args.volume_id, err))?;
     let geometry = session.geometry();
+    let _session = session;
+
+    let runtime = runtime::start_device(DeviceStartConfig {
+        control_device: args.ublk_control_device.clone(),
+        volume_id: args.volume_id.clone(),
+        requested_device_id: args.ublk_device_id,
+        size_bytes: geometry.size_bytes,
+        block_size_bytes: geometry.block_size_bytes,
+        queues: args.ublk_queues,
+        queue_depth: args.ublk_queue_depth,
+    })
+    .await
+    .map_err(|err| anyhow::anyhow!("failed to start ublk runtime: {}", err.message))?;
 
     eprintln!(
-        "temporal-ublk attach foundation ready: volume_id={} size_bytes={} block_size_bytes={} control_device={}",
+        "temporal-ublk attach ready: volume_id={} size_bytes={} block_size_bytes={} device_id={} device_path={} control_device={}",
         args.volume_id,
         geometry.size_bytes,
         geometry.block_size_bytes,
+        runtime.device_id,
+        runtime.device_path,
         args.ublk_control_device.display(),
     );
     eprintln!("waiting for shutdown signal");
     let _ = wait_for_shutdown_signal().await?;
+    runtime.request_stop();
+    timeout(Duration::from_secs(args.ublk_timeout_secs), runtime.wait())
+        .await
+        .context("timed out waiting for ublk detach")?
+        .map_err(|err| anyhow::anyhow!("ublk runtime shutdown failed: {}", err.message))?;
     Ok(())
 }
 
 async fn run_serve_mode(args: ServeArgs) -> anyhow::Result<()> {
-    let _unused_runtime_knobs = (
-        args.default_ublk_queues,
-        args.default_ublk_queue_depth,
-        args.default_ublk_timeout_secs,
-        args.metrics_listen,
-    );
-
     run_serve(ServeConfig {
         frontend_endpoint: args.frontend_endpoint,
         namespace: args.namespace,
+        ublk_control_device: args.ublk_control_device,
         control_socket: args.control_socket,
         max_devices: args.max_devices,
         terminal_history_limit: args.terminal_history_limit,
         idempotency_cache_limit: args.idempotency_cache_limit,
+        default_ublk_queues: args.default_ublk_queues,
+        default_ublk_queue_depth: args.default_ublk_queue_depth,
+        default_ublk_timeout: Duration::from_secs(args.default_ublk_timeout_secs),
+        metrics_listen: args.metrics_listen,
         ready_file: args.ready_file,
         connect_timeout: Duration::from_secs(args.connect_timeout_secs),
         rpc_timeout: Duration::from_secs(args.rpc_timeout_secs),
